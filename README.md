@@ -1,0 +1,121 @@
+# orcestrationmaxxing
+
+**Stop babysitting one agent. Run a dev team of them, with one chat as the tech lead.**
+
+One long-lived chat plans the work. Every ticket goes to a fresh worker agent in its own git worktree. The worker codes, tests, and reports back. The chat verifies the result, reviews it, merges it, and starts the next ticket. You talk to one chat. The board updates itself.
+
+It's a Ralph-style loop with management on top. Each worker starts with a fresh context and a fixed contract. State lives in SQLite and git, not in a chat that compacts it away.
+
+Built on [Orca](https://github.com/stablyai/orca) (worktrees, terminals, orchestration messages) and [OMP](https://github.com/can1357/oh-my-pi) (the agent harness, its extensions, and subagents).
+
+## Why it exists
+
+One agent that runs all day goes bad in a predictable way. A real session from this setup's history shows the pattern:
+
+- 1 worker, 6 h 42 min, 344 turns, about 500K tokens of context on every turn by the end.
+- 42 full test runs, mostly on failures that already existed on `main`.
+- Its own review loop on top of the human's review: 2 reviewer subagents, then a re-review. That alone took about 2 hours and 8M tokens.
+- A ticket that quietly grew into 33 files and +1609/-1240 lines.
+
+This repo encodes the fixes as rules that the tooling enforces, not as advice in a prompt:
+
+| Problem | What enforces the fix |
+|---|---|
+| The coordinator "just quickly" edits code itself | An OMP extension blocks file edits and file-changing subagents in the coordinator chat |
+| The ticket grows in scope | The worker contract says: only this ticket. Out-of-scope work goes back to the coordinator as a question. Ask first if the diff will exceed about 300 lines |
+| Repeated full test runs | Typecheck plus related tests once. The full suite at most once. The coordinator compares failure names with the base branch |
+| The worker reviews its own work | Forbidden. Review happens once, in the coordinator chat |
+| The coordinator forgets its rules after compaction | The extension re-sends the coordinator's role after every compaction |
+| A crash loses track of what was in flight | A SQLite registry records each task, attempt, review, and approval, so `recover` can tell the state |
+
+## How it works
+
+```mermaid
+flowchart LR
+  U[You] --> C[Coordinator chat<br/>plans, never codes]
+  C -->|start-worker| W1[Worker in child worktree]
+  C -->|start-worker| W2[Worker in child worktree]
+  W1 -->|worker_done| C
+  W2 -->|worker_done| C
+  C --> V[verify → judge → board]
+  V -->|pass| M[merge → capture]
+  V -->|fail| R[rework: new attempt]
+  R --> C
+```
+
+1. **Plan.** The coordinator classifies the request. Small work becomes one worker. Large work becomes tickets in `.scratch/<feature>/issues/`, and `Blocked by:` lines become task dependencies.
+2. **Dispatch.** `start-worker` creates the Orca task, a child worktree, and the worker terminal in one call. It appends the worker contract to the brief and records the attempt.
+3. **Work.** The worker writes code through the `code-implementer` subagent and asks `worker-advisor` at decision points. It runs plain OMP, never plan mode, with no runtime advisor. It commits on its branch and sends `worker_done` exactly once.
+4. **Gate.** The coordinator runs `wait`, then three checks: `verify` (tests against the base branch), `judge` (code review), and `board` (scope and fit).
+5. **Ship.** If all three pass and the result matches what you asked for, the coordinator approves and merges without asking you. `merge` leaves your uncommitted files alone. It refuses only if the branch touches one of them or the merge conflicts. Merge and deploy are separate steps.
+6. **Remember.** `capture` appends `DECISION:` lines to the project's `decisions.md`. `SOT(area):` lines tell the coordinator which architecture, business, dev, or product docs to update before the task closes.
+
+The Orca board follows the lifecycle by itself: working is In progress, review is In review, rework is To Fix, and merged is Done.
+
+## Buzzword bingo, honestly
+
+- **Ralph loop**: yes, in spirit. Each worker gets a fresh context, a fixed contract, and backpressure from tests. It's not a bare `while true` loop. A coordinator decides what runs next.
+- **Parallel agents in git worktrees**: yes. Orca runs one child worktree per worker. Independent tickets run at the same time.
+- **LLM-as-judge**: yes. `judge` and `board` are recorded review verdicts, and `merge` refuses without them.
+- **Context engineering**: yes. The worker contract is short and appended to every brief. The coordinator's role survives compaction. Each worker starts with a small context.
+- **Spec-driven development**: yes. Tickets have acceptance criteria, and imported tickets keep their dependencies.
+- **Human in the loop**: where it matters. You approve product decisions and deploys. Routine merges after passing gates are automatic.
+
+## What's inside
+
+| Path | What it is |
+|---|---|
+| `bin/orca-lifecycle.py` | The registry CLI (Python 3.9+, stdlib only): `start-worker`, `wait`, `verify`, `review`, `approve`, `merge`, `accept`, `capture`, `recover`, `status`, `discard`, and more |
+| `omp/orca-triage/` | The OMP extension. It loads the control-plane snapshot at session start and after compaction, and blocks code edits in the coordinator chat |
+| `skills/orca-triage-loop/SKILL.md` | The coordinator's playbook |
+| `agents/code-implementer.md`, `agents/worker-advisor.md` | The two subagents that workers use |
+| `bin/install-orca-triage.sh` | The installer for the extension and the CLI |
+| `tests/` | 64 lifecycle tests (pytest) and 34 extension tests (`bun test`) |
+
+## Install
+
+Requirements: macOS, [Orca](https://github.com/stablyai/orca) 1.4.222 or later, OMP, Python 3.9+. To run the extension tests, you also need Bun. The install paths use `~/Library`, so other operating systems need path changes.
+
+```bash
+git clone https://github.com/dperhar/orcestrationmaxxing && cd orcestrationmaxxing
+bash bin/install-orca-triage.sh            # dry run: shows what it will copy
+bash bin/install-orca-triage.sh --apply    # extension + CLI
+mkdir -p ~/.omp/agent/managed-skills/orca-triage-loop ~/.omp/agent/agents
+cp skills/orca-triage-loop/SKILL.md ~/.omp/agent/managed-skills/orca-triage-loop/
+cp agents/*.md ~/.omp/agent/agents/
+```
+
+The installer puts the CLI at `~/Library/Scripts/orcestrationmaxxing/orca-lifecycle.py`. The registry goes to `~/Library/Application Support/orcestrationmaxxing/orca-lifecycle.db`.
+
+Then turn one project into a triage project:
+
+```bash
+L=~/Library/Scripts/orcestrationmaxxing/orca-lifecycle.py
+cd /path/to/your/repo                     # the main checkout, opened as an Orca worktree
+"$L" project-add --repo-path .            # register the repo
+"$L" triage-here --dir .                  # the extension is active in this folder only
+orca orchestration run-create --objective "my project"
+```
+
+Open OMP in that folder. The extension shows the control-plane snapshot. Ask for work in plain language. The coordinator takes it from there.
+
+To run the tests:
+
+```bash
+python3 -m pytest -q tests/test_orca_lifecycle.py
+cd omp/orca-triage && bun test
+```
+
+## Rules worth knowing before you start
+
+- **One repo per coordinator.** Orca links a child worktree only inside the same repo. Run the coordinator chat in a worktree of the code's repo. Otherwise `start-worker` refuses, because the worker would not be its child.
+- **The coordinator never writes code.** In its chat, the extension blocks `edit`/`write` on project files and every subagent that can change files. Read-only subagents stay allowed: `scout`, `reviewer`, `security-reviewer`, `council-strategist`, and `improve-*`.
+- **Workers never start in plan mode.** Planning happens in the coordinator chat. Each worker starts with an overlay config that turns plan mode and the runtime advisor off.
+- **Nothing is deleted to recover.** `recover` never deletes a branch. It reports what Orca can prove about each worker and leaves the decision to the coordinator.
+- **The coordinator's role refers to skills you may not have.** `work-routing` and `to-tickets` are referenced but not shipped here. Without them, the coordinator still works. It just plans with its own judgment.
+
+## Status
+
+This is a personal setup that runs real projects every day. It is not a polished product. Expect sharp edges around Orca version changes, and read `skills/orca-triage-loop/SKILL.md` before your first run.
+
+License: MIT.
