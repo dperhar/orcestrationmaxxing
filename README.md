@@ -1,10 +1,18 @@
 # orcestrationmaxxing
 
-**Stop babysitting one agent. Run a dev team of them, with one chat as the tech lead.**
+**A real agent swarm that ships to `main` while you sleep. You talk to one chat. It runs the rest.**
 
-One long-lived chat plans the work. Every ticket goes to a fresh worker agent in its own git worktree. The worker codes, tests, and reports back. The chat verifies the result, reviews it, merges it, and starts the next ticket. You talk to one chat. The board updates itself.
+Not a demo with three agents chatting in a loop. This is a working hierarchy, and it runs real projects every day:
 
-It's a Ralph-style loop with management on top. Each worker starts with a fresh context and a fixed contract. State lives in SQLite and git, not in a chat that compacts it away.
+- **1 coordinator** plans, splits work into tickets, reviews, merges, and keeps the docs current. It can't write code. An extension physically blocks it.
+- **N workers** run in parallel, each in its own git worktree with a fresh context. They code, test, commit, and report back exactly once.
+- **Each worker has its own subagents**: an implementer that writes the code and an advisor it consults at decision points.
+- **The coordinator has its own reviewers**: code review, security review, and a strategy council before anything merges.
+- **Gates, not vibes**: nothing reaches `main` without a recorded verify, judge, and board verdict.
+
+The board moves cards by itself. Crashes don't lose work. A SQLite registry knows every task, attempt, and verdict. Compaction can't make the coordinator forget its job, because its role is re-injected after every compaction.
+
+It's a Ralph loop with a management layer on top. Each worker starts fresh with a fixed contract. State lives in SQLite and git, not in a chat that compacts it away.
 
 Built on [Orca](https://github.com/stablyai/orca) (worktrees, terminals, orchestration messages) and [OMP](https://github.com/can1357/oh-my-pi) (the agent harness, its extensions, and subagents).
 
@@ -55,6 +63,7 @@ The Orca board follows the lifecycle by itself: working is In progress, review i
 ## Buzzword bingo, honestly
 
 - **Ralph loop**: yes, in spirit. Each worker gets a fresh context, a fixed contract, and backpressure from tests. It's not a bare `while true` loop. A coordinator decides what runs next.
+- **Agent swarm**: yes, a hierarchical one. One coordinator, N parallel workers, and subagents under each. Roles are separate, and the tooling enforces the boundaries.
 - **Parallel agents in git worktrees**: yes. Orca runs one child worktree per worker. Independent tickets run at the same time.
 - **LLM-as-judge**: yes. `judge` and `board` are recorded review verdicts, and `merge` refuses without them.
 - **Context engineering**: yes. The worker contract is short and appended to every brief. The coordinator's role survives compaction. Each worker starts with a small context.
