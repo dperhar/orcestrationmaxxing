@@ -78,25 +78,32 @@ The Orca board follows the lifecycle by itself: working is In progress, review i
 
 | Path | What it is |
 |---|---|
-| `bin/orca-lifecycle.py` | The registry CLI (Python 3.9+, stdlib only): `start-worker`, `wait`, `verify`, `review`, `approve`, `merge`, `accept`, `capture`, `recover`, `status`, `discard`, and more |
-| `omp/orca-triage/` | The OMP extension. It loads the control-plane snapshot at session start and after compaction, and blocks code edits in the coordinator chat |
-| `skills/orca-triage-loop/SKILL.md` | The coordinator's playbook |
-| `agents/code-implementer.md`, `agents/worker-advisor.md` | The two subagents that workers use |
-| `bin/install-orca-triage.sh` | The installer for the extension and the CLI |
-| `tests/` | 74 lifecycle tests (pytest) and 34 extension tests (`bun test`) |
+| `bin/orca-lifecycle.py` | The registry CLI (Python 3.9+, stdlib only): `start-worker`, `wait`, `sync`, `verify`, `review`, `approve`, `merge`, `accept`, `capture`, `cancel`, `sweep`, `recover`, `status`, and more |
+| `omp/orca-triage/` | OMP extension for the coordinator chat: loads the control-plane snapshot at session start and after compaction, and blocks code edits there |
+| `omp/skill-router/` | OMP extension for every chat: classifies each request as SMALL / LARGE / MIX and injects the skills to follow |
+| `bin/refresh-skill-router-registry.py` | Builds the router's skill registry from what is installed on your machine |
+| `skills/` | `orca-triage-loop` (the coordinator's playbook), `work-routing`, `review-gate`, `result-fixation`, `improve` |
+| `agents/` | Workers: `code-implementer`, `worker-advisor`. Coordinator: `reviewer`, `council-strategist`, `improve-researcher`, `improve-critic`, `improve-scout` |
+| `install.sh` | Installs all of the above; dry run by default |
+| `tests/` | 74 lifecycle tests and 19 registry-generator tests (pytest), 34 coordinator-policy tests and 60 router tests (`bun test`) |
+
+What each part does, and what comes from upstream: [docs/PIPELINE.md](docs/PIPELINE.md), [THIRD_PARTY.md](THIRD_PARTY.md).
 
 ## Install
 
-Requirements: macOS, [Orca](https://github.com/stablyai/orca) 1.4.222 or later, OMP, Python 3.9+. To run the extension tests, you also need Bun. The install paths use `~/Library`, so other operating systems need path changes.
+Requirements: macOS, [Orca](https://github.com/stablyai/orca) 1.4.222 or later, OMP, Python 3.9+, Bun (for tests). The install paths use `~/Library`, so other operating systems need path changes.
 
 ```bash
 git clone https://github.com/dperhar/orcestrationmaxxing && cd orcestrationmaxxing
-bash bin/install-orca-triage.sh            # dry run: shows what it will copy
-bash bin/install-orca-triage.sh --apply    # extension + CLI
-mkdir -p ~/.omp/agent/managed-skills/orca-triage-loop ~/.omp/agent/agents
-cp skills/orca-triage-loop/SKILL.md ~/.omp/agent/managed-skills/orca-triage-loop/
-cp agents/*.md ~/.omp/agent/agents/
+npx skills add mattpocock/skills           # grilling, wayfinder, to-spec, to-tickets
+npx skills add stablyai/orca               # Orca's orchestration skill
+git clone https://github.com/tsergeytovarov/super-puper-powers ~/.config/opencode/super-puper-powers
+omp plugin link ~/.config/opencode/super-puper-powers      # plan-writing, TDD, debugging, verification
+bash install.sh                            # dry run: shows what it will copy
+bash install.sh --apply                    # lifecycle, both extensions, skills, agents, router registry
 ```
+
+`install.sh` never overwrites a skill or agent you changed; pass `--force` for that. Run it again after you add or update skills, so the router sees them.
 
 The installer puts the CLI at `~/Library/Scripts/orcestrationmaxxing/orca-lifecycle.py`. The registry goes to `~/Library/Application Support/orcestrationmaxxing/orca-lifecycle.db`.
 
@@ -115,8 +122,9 @@ Open OMP in that folder. The extension shows the control-plane snapshot. Ask for
 To run the tests:
 
 ```bash
-python3 -m pytest -q tests/test_orca_lifecycle.py
+/usr/bin/python3 -m pytest -q tests/
 cd omp/orca-triage && bun test
+cd ~/.omp/agent/extensions/skill-router && bun test     # after install.sh built the registry
 ```
 
 ## Rules worth knowing before you start
@@ -127,7 +135,7 @@ cd omp/orca-triage && bun test
 - **Nothing is deleted to recover.** `recover` never deletes a branch. It reports what Orca can prove about each worker and leaves the decision to the coordinator.
 - **No work is left in the field.** Every task ends merged and captured, accepted, or cancelled. `sweep` lists every idle open task with its next step. Run it on a schedule as an Orca automation (`orca automations create --trigger "0 10 */2 * *" --precheck "python3 <cli> sweep --precheck --repo <repo>" ...`): the precheck exits 0 only when something is left, so the coordinator wakes up only when there is work. It finishes each leftover, unless the owner dropped it (his words, `decisions.md`, or the backlog's "do not do" section) or the work became unnecessary. Then `cancel` records that decision before it stops any worker, and a cancelled task is never resumed.
 - **Stale branches don't get verified.** `verify` refuses a branch behind the base or with uncommitted work. `sync` merges the base into the worker branch; a conflict aborts and sends the task back to rework with the files listed.
-- **The coordinator's role refers to skills you may not have.** `work-routing` and `to-tickets` are referenced but not shipped here. Without them, the coordinator still works. It just plans with its own judgment.
+- **Missing optional skills don't break anything.** The router names more skills than this repo installs. A missing one becomes `skill://<name>` and the agent continues.
 
 ## Status
 
