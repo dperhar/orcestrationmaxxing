@@ -418,17 +418,35 @@ def board_status_id(column: str) -> str:
     return next((s["id"] for s in statuses if str(s.get("label", "")).strip().lower() == "to fix"), "in-progress")
 
 
+def orca_worktree_selectors(worktree_path: str) -> list[str]:
+    """Every Orca worktree record for this folder, as `id:` selectors.
+
+    One folder can have several records: a repo registered twice (for example through a symlink and its target)
+    lists the same worktree under each registration. `path:` picks one of them, and the board may show the other,
+    so the card never moves. Falls back to `path:` when the list call fails or finds nothing."""
+    want = os.path.realpath(worktree_path)
+    try:
+        ok, data = orca_raw("worktree", "list", timeout=15)
+    except OrcaError:
+        ok, data = False, {}
+    ids = [w["id"] for w in ((data.get("result") or {}).get("worktrees") or []) if ok and w.get("id")
+           and w.get("path") and os.path.realpath(w["path"]) == want]
+    return [f"id:{i}" for i in ids] or [f"path:{worktree_path}"]
+
+
 def set_board_status(db, dispatch_id: str, worktree_path: str, status: str) -> None:
     """Move the worker worktree on the Orca board. A board failure never blocks the lifecycle; it is logged."""
-    try:
-        # Short timeout: this call runs inside the registry transaction and is not essential.
-        ok, data = orca_raw("worktree", "set", "--worktree", f"path:{worktree_path}", "--workspace-status", status,
-                            timeout=15)
-        error = None if ok else (data.get("error") or "orca returned ok=false")
-    except OrcaError as exc:
-        error = str(exc)
-    log_event(db, "attempt", dispatch_id, "board_status_failed" if error else "board_status",
-              {"status": status, "worktree": worktree_path, **({"error": error} if error else {})})
+    errors = []
+    for selector in orca_worktree_selectors(worktree_path):
+        try:
+            # Short timeout: this call runs inside the registry transaction and is not essential.
+            ok, data = orca_raw("worktree", "set", "--worktree", selector, "--workspace-status", status, timeout=15)
+            if not ok:
+                errors.append({"selector": selector, "error": data.get("error") or "orca returned ok=false"})
+        except OrcaError as exc:
+            errors.append({"selector": selector, "error": str(exc)})
+    log_event(db, "attempt", dispatch_id, "board_status_failed" if errors else "board_status",
+              {"status": status, "worktree": worktree_path, **({"errors": errors} if errors else {})})
 
 
 def pending_questions(run_ids: list[str]) -> list[dict]:
@@ -1286,13 +1304,14 @@ def _finish_worktrees(db, task_id: str, repo: str, remove: bool, out: dict, forc
             set_board_status(db, att["dispatch_id"], wt, "completed")
         force = force_latest and is_latest
         if remove:
-            args, done, failed = ("worktree", "rm", "--worktree", f"path:{wt}", *(["--force"] if force else [])), \
+            calls, done, failed = [("worktree", "rm", "--worktree", f"path:{wt}", *(["--force"] if force else []))], \
                 "worktree_removed", "worktree_remove_failed"
         else:
-            args, done, failed = ("terminal", "close", "--worktree", f"path:{wt}", "--all"), \
+            calls, done, failed = [("terminal", "close", "--worktree", s, "--all") for s in orca_worktree_selectors(wt)], \
                 "terminals_closed", "terminals_close_failed"
         try:
-            orca(*args)
+            for args in calls:
+                orca(*args)
             log_event(db, "attempt", att["dispatch_id"], done, {"path": wt, "force": force})
             out.setdefault(done, []).append(wt)
         except OrcaError as exc:

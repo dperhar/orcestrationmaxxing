@@ -39,6 +39,8 @@ STUB = textwrap.dedent(
         state["created"].append(task)
         state.setdefault("tasks", []).append(task)
         result = {"task": task}
+    elif verb == "worktree list":
+        result = {"worktrees": state.get("orca_worktrees", [])}
     elif verb == "worktree create":
         result = {"worktree": {"id": "repo::" + os.environ["ORCA_STUB_WORKTREE"]}}
     elif verb == "terminal create":
@@ -714,7 +716,7 @@ def test_start_worker_picks_the_start_orca_accepts(env, project, orca_status, re
     # agents other than OMP keep the one-call agent-first start: no adopted terminal, no low-level launch calls
     assert "--terminal" not in start and start[start.index("--agent") + 1] == "claude"
     calls = json.loads(env["state"].read_text())["calls"]
-    assert not [c for c in calls if c[0] in ("worktree", "terminal") and c[:2] != ["worktree", "set"]]
+    assert not [c for c in calls if c[0] in ("worktree", "terminal") and c[:2] not in (["worktree", "set"], ["worktree", "list"])]
     assert '"class":"small"' in dict(events(env, "started"))["ctx_new1"]
     assert _board(env, project["wt"])[-1] == "in-progress"
 
@@ -753,7 +755,7 @@ def test_omp_worker_never_starts_in_plan_mode(env, project, work_class):
     out = jrun(env, "start-worker", "--task", "task_a", "--class", work_class, "--agent", "omp")
 
     calls = json.loads(env["state"].read_text())["calls"]
-    launch = [c for c in calls if (c[0] in ("worktree", "terminal") and c[:2] != ["worktree", "set"])
+    launch = [c for c in calls if (c[0] in ("worktree", "terminal") and c[:2] not in (["worktree", "set"], ["worktree", "list"]))
               or c[:2] == ["orchestration", "worker-start"]]
     assert [c[:2] for c in launch] == [["worktree", "create"], ["terminal", "create"], ["terminal", "wait"],
                                        ["orchestration", "worker-start"], ["terminal", "wait"],
@@ -1291,3 +1293,19 @@ def test_cancel_keeps_confirmed_stops_and_the_owner_reason_when_one_worker_will_
     assert done["stopped"] == ["ctx_2"] and stage(env) == "closed"
     result = [c for c in json.loads(env["state"].read_text())["calls"] if c[:2] == ["orchestration", "task-update"]][-1]
     assert result[result.index("--result") + 1] == "cancelled (by owner): dropped"
+
+
+def test_board_status_moves_every_orca_record_of_the_worker_folder(env, project):
+    # A repo registered twice (symlink and target) lists one folder under two ids; the board may show either.
+    wt = str(project["wt"])
+    state = json.loads(env["state"].read_text())
+    state["orca_worktrees"] = [{"id": f"old::{wt}", "path": wt}, {"id": f"new::{wt}", "path": wt},
+                               {"id": "other::/elsewhere", "path": "/elsewhere"}]
+    before = len(state["calls"])
+    env["state"].write_text(json.dumps(state))
+
+    jrun(env, "ingest", stdin=batch(worker_done()))
+
+    sets = [c[c.index("--worktree") + 1] for c in json.loads(env["state"].read_text())["calls"][before:]
+            if c[:2] == ["worktree", "set"]]
+    assert sets == [f"id:old::{wt}", f"id:new::{wt}"]

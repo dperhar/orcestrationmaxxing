@@ -85,7 +85,7 @@ The Orca board follows the lifecycle by itself: working is In progress, review i
 | `skills/` | `orca-triage-loop` (the coordinator's playbook), `work-routing`, `review-gate`, `result-fixation`, `improve` |
 | `agents/` | Workers: `code-implementer`, `worker-advisor`. Coordinator: `reviewer`, `council-strategist`, `improve-researcher`, `improve-critic`, `improve-scout` |
 | `install.sh` | Installs all of the above; dry run by default |
-| `tests/` | 74 lifecycle tests and 19 registry-generator tests (pytest), 34 coordinator-policy tests and 60 router tests (`bun test`) |
+| `tests/` | 75 lifecycle tests and 19 registry-generator tests (pytest), 34 coordinator-policy tests and 60 router tests (`bun test`) |
 
 What each part does, and what comes from upstream: [docs/PIPELINE.md](docs/PIPELINE.md), [THIRD_PARTY.md](THIRD_PARTY.md).
 
