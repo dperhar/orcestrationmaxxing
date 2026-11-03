@@ -425,13 +425,24 @@ def orca_worktree_selectors(worktree_path: str) -> list[str]:
     lists the same worktree under each registration. `path:` picks one of them, and the board may show the other,
     so the card never moves. Falls back to `path:` when the list call fails or finds nothing."""
     want = os.path.realpath(worktree_path)
-    try:
-        ok, data = orca_raw("worktree", "list", timeout=15)
-    except OrcaError:
-        ok, data = False, {}
-    ids = [w["id"] for w in ((data.get("result") or {}).get("worktrees") or []) if ok and w.get("id")
-           and w.get("path") and os.path.realpath(w["path"]) == want]
+    ids = [w["id"] for w in _orca_worktree_list() if w.get("id") and w.get("path")
+           and os.path.realpath(w["path"]) == want]
     return [f"id:{i}" for i in ids] or [f"path:{worktree_path}"]
+
+
+_WORKTREE_LIST: list[dict] | None = None
+
+
+def _orca_worktree_list() -> list[dict]:
+    """`orca worktree list`, fetched once per command: the registry transaction is open while it runs."""
+    global _WORKTREE_LIST
+    if _WORKTREE_LIST is None:
+        try:
+            ok, data = orca_raw("worktree", "list", timeout=15)
+        except OrcaError:
+            ok, data = False, {}
+        _WORKTREE_LIST = ((data.get("result") or {}).get("worktrees") or []) if ok else []
+    return _WORKTREE_LIST
 
 
 def set_board_status(db, dispatch_id: str, worktree_path: str, status: str) -> None:
