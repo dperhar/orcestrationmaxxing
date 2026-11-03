@@ -57,7 +57,7 @@ Every spec needs Target, Change, Constraints, Ownership, and Observable acceptan
 ## 4. After a successful worker_done
 
 1. Release the worker terminal as the Orca guide requires (`orca orchestration worker-release --dispatch <id>`).
-2. Run the acceptance test. Record it: `"$L" verify --task <t> --verdict pass|fail --evidence "<command + result>"`.
+2. Run the acceptance test. Record it: `"$L" verify --task <t> --verdict pass|fail --evidence "<command + result>"`. A `pass` is refused when the worker worktree has uncommitted tracked changes (commit them on the branch, or ask the worker to) or when the branch is behind the base. Then run `"$L" sync --task <t>`: it merges the current base into the branch in its worktree. Rerun the tests there, then verify. If the merge conflicts, `sync` aborts it, leaves the worktree as it was, and sends the task to rework with the conflicting files; the next worker continues the same branch and resolves them.
 3. Judge: for code, write `git diff <base>...<branch>` and `git log <base>..<branch> --name-status` to a file. For a report, use the report path. Give that file to the `reviewer` role (it has no shell). Record: `"$L" review --task <t> --kind judge --verdict pass|fail --evidence "<summary + file>"`.
 4. Board: spawn `council-strategist` for scope and fit. Record it with `--kind board`.
 5. If any verdict is `fail`, run the `improve` skill on the evidence. Then run `"$L" start-worker --task <t> --class <same class> --agent <agent>`.
@@ -78,6 +78,16 @@ Every spec needs Target, Change, Constraints, Ownership, and Observable acceptan
 - `liveness_unknown`: `worker-list` failed. Nothing changed. Run `recover` again later.
 - `completed` / `completed_without_report`: Orca shows the work as done. With a valid stored report, recovery settles the task. Without one, nothing changes.
 - Never delete a branch to recover. Never call `worker-abandon` or `worker-stop` without the proof that the Orca guide requires.
+
+## 6. Leftovers and cancellation
+
+No worker's work is dropped silently. Every task ends merged and captured, accepted, or cancelled.
+
+- `"$L" sweep [--min-idle-hours 24]` runs `recover`, then lists every open task idle for that long, with branch, commits behind the base, uncommitted files, and the exact next step. `--precheck` is read-only: exit 0 when a leftover exists, 1 when none.
+- The Orca automation "Leftover sweep" (see the README) runs every 2 days in the project's triage worktree with that precheck. It is a coordinator pass: for each leftover it decides cancel or finish.
+- Cancel only on evidence: the owner said to drop it (his words in chat, `decisions.md`, a ticket, the Orca task result, or his backlog), or the work became unnecessary (the base already does what the acceptance asks, or a later merged task replaced the scope). Run `"$L" cancel --task <t> --by <owner|coordinator> --reason "<evidence>" [--answer "<owner's words>"]`. It stops the active worker, keeps the branch and worktree, and closes the task.
+- The owner's backlog (for example `backlog.md` in the project folder) is evidence. An item under a "do not do" section (such as `## Не делать`) or marked killed or dropped: cancel, and quote the backlog line in `--reason`. An item under "waiting for the owner's decision": do not cancel and do not finish; list it for the owner. Any other item, including "later": finish it. A task that is simply missing from the backlog is not evidence.
+- Otherwise finish the task: follow the `next` step of the sweep row, through verify, judge, board, approve, merge, and capture. When in doubt, finish; do not cancel.
 
 ## Rules
 

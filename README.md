@@ -2,6 +2,10 @@
 
 **A real agent swarm that ships to `main` while you sleep. You talk to one chat. It runs the rest.**
 
+![A field of agents, each with an orange starburst for a head, bent over the rows doing the work. Two overseers with whips stand at the edge of the field.](assets/the-field.png)
+
+*Yes, this is the architecture diagram. The agents in the field are the workers: one per git worktree, heads down, one ticket each. The two guys at the edge are the coordinator chat and its reviewers. Nobody in the field merges anything. Nobody at the edge writes code. The whip is `verify`, and it refuses a branch that is behind `main` or has uncommitted work.*
+
 Not a demo with three agents chatting in a loop. This is a working hierarchy, and it runs real projects every day:
 
 - **1 coordinator** plans, splits work into tickets, reviews, merges, and keeps the docs current. It can't write code. An extension physically blocks it.
@@ -79,7 +83,7 @@ The Orca board follows the lifecycle by itself: working is In progress, review i
 | `skills/orca-triage-loop/SKILL.md` | The coordinator's playbook |
 | `agents/code-implementer.md`, `agents/worker-advisor.md` | The two subagents that workers use |
 | `bin/install-orca-triage.sh` | The installer for the extension and the CLI |
-| `tests/` | 64 lifecycle tests (pytest) and 34 extension tests (`bun test`) |
+| `tests/` | 74 lifecycle tests (pytest) and 34 extension tests (`bun test`) |
 
 ## Install
 
@@ -121,6 +125,8 @@ cd omp/orca-triage && bun test
 - **The coordinator never writes code.** In its chat, the extension blocks `edit`/`write` on project files and every subagent that can change files. Read-only subagents stay allowed: `scout`, `reviewer`, `security-reviewer`, `council-strategist`, and `improve-*`.
 - **Workers never start in plan mode.** Planning happens in the coordinator chat. Each worker starts with an overlay config that turns plan mode and the runtime advisor off.
 - **Nothing is deleted to recover.** `recover` never deletes a branch. It reports what Orca can prove about each worker and leaves the decision to the coordinator.
+- **No work is left in the field.** Every task ends merged and captured, accepted, or cancelled. `sweep` lists every idle open task with its next step. Run it on a schedule as an Orca automation (`orca automations create --trigger "0 10 */2 * *" --precheck "python3 <cli> sweep --precheck --repo <repo>" ...`): the precheck exits 0 only when something is left, so the coordinator wakes up only when there is work. It finishes each leftover, unless the owner dropped it (his words, `decisions.md`, or the backlog's "do not do" section) or the work became unnecessary. Then `cancel` records that decision before it stops any worker, and a cancelled task is never resumed.
+- **Stale branches don't get verified.** `verify` refuses a branch behind the base or with uncommitted work. `sync` merges the base into the worker branch; a conflict aborts and sends the task back to rework with the files listed.
 - **The coordinator's role refers to skills you may not have.** `work-routing` and `to-tickets` are referenced but not shipped here. Without them, the coordinator still works. It just plans with its own judgment.
 
 ## Status

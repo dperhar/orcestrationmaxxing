@@ -29,6 +29,10 @@ const ROLE =
   "If merge is blocked by uncommitted files or a conflict, find the agent or worktree that made them (session " +
   "transcripts, mtimes), ask it to finish and signal you, wait, then merge. Never ask the owner about that and " +
   "never stash others' work. Then capture and update the live SoT docs. " +
+  "No work is dropped silently: every task ends merged and captured, accepted, or cancelled. `sweep` lists the " +
+  "leftovers. Finish each one. `cancel` a task, with the evidence, only when the owner dropped it (his words, " +
+  "`decisions.md`, or his backlog's \"do not do\" section) or the work became unnecessary. Verify refuses a " +
+  "branch that is behind the base or has uncommitted work: run `sync`. " +
   "Subagents: you may spawn only read-only ones (the extension blocks the rest): `scout` to find and read code " +
   "cheaply, `reviewer`/`security-reviewer` to review a worker's diff, `council-strategist` for judgment calls, " +
   "`improve-*` for research. If a named agent does not exist, take the closest similar read-only one; if none " +

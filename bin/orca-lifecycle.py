@@ -87,7 +87,10 @@ Review and tests
   the failure names with the base branch.
 - Keep your context small: read only the files you need, print only the tail of long outputs.
 Delivery
-- Code task: commit every change on your current branch. Do not push. Do not merge.
+- Code task: commit every change on your current branch. Do not push. Do not merge into the base branch.
+  Before worker_done, merge the latest base branch into your branch, resolve any conflicts, and rerun the
+  related tests. Leave no uncommitted changes: verification refuses a branch that is behind the base or a
+  worktree with uncommitted work.
 - Report task: write the result as Markdown to a file in your worktree. Pass its absolute path with
   `--report-path` in worker_done.
 - Put each durable decision on its own line as `DECISION: <one short sentence>` in the worker_done body or the
@@ -793,6 +796,8 @@ def cmd_verify(db, a) -> dict:
     if a.verdict == "fail":
         set_stage(db, a.task, "rework", ("verifying",), {"verdict": a.verdict})
         return {"task_id": a.task, "stage": "rework", "next": _rework_hint(task)}
+    if task["kind"] == "code":
+        _require_fresh(db, task)
     # Every later verdict and the human approval refer to this exact commit or report.
     pin = _pin_report(db, task) if task["kind"] == "report" else _branch_tip(db, a.task)[2]
     db.execute("UPDATE tasks SET reviewed_sha=? WHERE task_id=?", (pin, a.task))
@@ -801,6 +806,153 @@ def cmd_verify(db, a) -> dict:
     return {"task_id": a.task, "stage": "reviewing", "reviewed_sha": pin,
             "next": f"run judge (reviewer) and board (council-strategist) on {target},"
                     f" then `review --task {a.task}`"}
+
+
+def _freshness(db, task: sqlite3.Row) -> dict | None:
+    """Where the task's latest branch stands against the project base: commits behind, and uncommitted tracked
+    files in its worktree. None when the task has no branch that still exists."""
+    attempt = db.execute("SELECT * FROM attempts WHERE task_id=? AND branch IS NOT NULL"
+                         " ORDER BY created_at DESC, rowid DESC LIMIT 1", (task["task_id"],)).fetchone()
+    project = get_project(db, task["project_id"])
+    repo, base = project["repo_path"], project["base_branch"]
+    if attempt is None or git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{attempt['branch']}",
+                              check=False).returncode != 0:
+        return None
+    branch, wt = attempt["branch"], attempt["worktree_path"]
+    if not (wt and Path(wt).is_dir()
+            and git(wt, "rev-parse", "--abbrev-ref", "HEAD", check=False).stdout.strip() == branch):
+        wt = None
+    dirty = sorted(line[3:] for line in git(wt, "status", "--porcelain", "--no-renames", "--untracked-files=no")
+                   .stdout.split("\n") if line) if wt else []
+    behind = int(git(repo, "rev-list", "--count", f"refs/heads/{branch}..refs/heads/{base}",
+                     check=False).stdout.strip() or 0)
+    return {"branch": branch, "base": base, "worktree": wt, "dirty": dirty, "behind": behind, "repo": repo}
+
+
+def _require_fresh(db, task: sqlite3.Row) -> dict:
+    """A pass verdict must describe what merge will produce: committed work on top of the current base."""
+    fresh = _freshness(db, task)
+    if fresh is None:
+        raise Refused(f"task {task['task_id']} has no branch to verify")
+    if fresh["dirty"]:
+        raise Refused(f"the worker worktree {fresh['worktree']} has uncommitted changes: {', '.join(fresh['dirty'])}."
+                      f" They are not on {fresh['branch']} and would be lost. Commit them there (or ask the"
+                      f" worker to), then verify again")
+    if fresh["behind"]:
+        raise Refused(f"branch '{fresh['branch']}' is {fresh['behind']} commit(s) behind '{fresh['base']}', so a"
+                      f" pass would not describe the merge target. Run `orca-lifecycle.py sync --task"
+                      f" {task['task_id']}`, rerun the tests, then verify")
+    return fresh
+
+
+def cmd_sync(db, a) -> dict:
+    """Merge the current base into the worker branch, in its worktree, before verification. A conflict aborts the
+    merge (the worktree stays as it was) and sends the task to rework with the conflicting files on record."""
+    task = get_task(db, a.task)
+    if task["stage"] != "verifying" or task["kind"] != "code":
+        raise Refused(f"task {a.task} is a {task['kind']} task in stage '{task['stage']}'; sync needs a code task"
+                      f" in 'verifying' (after review, `merge` already merges onto the current base)")
+    fresh = _freshness(db, task)
+    if fresh is None or fresh["worktree"] is None:
+        raise Refused(f"task {a.task} has no worker worktree on its branch; {_retry_hint(task)}")
+    if fresh["dirty"]:
+        raise Refused(f"the worker worktree {fresh['worktree']} has uncommitted changes: {', '.join(fresh['dirty'])};"
+                      f" commit them on {fresh['branch']} first, so the merge cannot touch them")
+    out = {"task_id": a.task, "branch": fresh["branch"], "behind_before": fresh["behind"]}
+    if not fresh["behind"]:
+        return {**out, "stage": "verifying", "merged_base": None, "next": f"verify --task {a.task}"}
+    wt, base = fresh["worktree"], fresh["base"]
+    merged = git(wt, "merge", "--no-edit", "-m", f"sync({a.task}): merge {base}", f"refs/heads/{base}", check=False)
+    if merged.returncode != 0:
+        conflicts = sorted(f for f in git(wt, "diff", "--name-only", "--diff-filter=U").stdout.split("\n") if f)
+        git(wt, "merge", "--abort", check=False)
+        set_stage(db, a.task, "rework", ("verifying",), {"sync_conflicts": conflicts, "base": base})
+        return {**out, "stage": "rework", "conflicts": conflicts,
+                "next": f"{_retry_hint(task)}; tell the new worker to continue {fresh['branch']}: merge '{base}'"
+                        f" into {fresh['branch']}, resolve {', '.join(conflicts) or 'the conflicts'}, rerun the"
+                        f" related tests"}
+    log_event(db, "task", a.task, "synced", {"base": base, "behind": fresh["behind"],
+                                             "tip": git(wt, "rev-parse", "HEAD").stdout.strip()})
+    return {**out, "stage": "verifying", "merged_base": base,
+            "next": f"rerun the tests in {wt}, then `verify --task {a.task}`"}
+
+
+def _cancel_pending(db, task_id: str) -> dict | None:
+    """The Orca Tasks a past cancel could not mark cancelled, with the original result text; None when none."""
+    row = db.execute("SELECT transition, evidence_json FROM events WHERE entity_type='task' AND entity_id=?"
+                     " AND transition IN ('cancel_orca_pending','cancel_orca_done') ORDER BY event_id DESC LIMIT 1",
+                     (task_id,)).fetchone()
+    if row is None or row["transition"] == "cancel_orca_done":
+        return None
+    return json.loads(row["evidence_json"])
+
+
+def _mark_orca_cancelled(db, task: sqlite3.Row, orca_tasks: list[str], result: str) -> list[str]:
+    failed = []
+    for orca_task in orca_tasks:
+        ok, _ = orca_raw("orchestration", "task-update", "--id", orca_task, "--status", "failed",
+                         "--result", result, "--run", task["run_id"])
+        if not ok:
+            failed.append(orca_task)
+    if failed:
+        log_event(db, "task", task["task_id"], "cancel_orca_pending", {"orca_tasks": failed, "result": result})
+    else:
+        log_event(db, "task", task["task_id"], "cancel_orca_done", {"orca_tasks": orca_tasks})
+    return failed
+
+
+def cmd_cancel(db, a) -> dict:
+    """The owner (or the coordinator on the owner's word) drops a task. Its branch and worktree stay; only the
+    work stops. The workers stop first; if Orca cannot stop one, nothing is recorded and cancel can run again.
+    If Orca then cannot mark a Task cancelled, the task is closed here but `sweep` keeps listing it until a
+    repeated `cancel` marks it."""
+    task = get_task(db, a.task)
+    if not a.reason.strip():
+        raise Refused("--reason must say why the work is dropped")
+    result = f"cancelled (by {a.by}): {a.reason}"
+    if task["stage"] == "closed":
+        pending = _cancel_pending(db, a.task)
+        if pending is None:
+            raise Refused(f"task {a.task} is closed; its work is already finished or cancelled")
+        # The retry keeps the original cancellation text, so Orca records who dropped it and why.
+        failed = _mark_orca_cancelled(db, task, pending["orca_tasks"], pending["result"])
+        return {"task_id": a.task, "stage": "closed", "cancelled": True, "orca_pending": failed}
+    if task["stage"] == "merged":
+        raise Refused(f"task {a.task} is merged; its work is already in the base")
+    # Record the owner's decision durably before any Orca side effect, and commit each confirmed stop before
+    # the next call. A crash or a refused stop leaves the intent on record: sweep then only finishes the cancel.
+    intent = _cancel_intent(db, a.task) or {"by": a.by, "reason": a.reason, "answer": a.answer}
+    log_event(db, "task", a.task, "cancel_requested", intent)
+    stopped, unstopped = [], []
+    for att in db.execute("SELECT * FROM attempts WHERE task_id=? AND status='active'", (a.task,)).fetchall():
+        ok, data = _unlocked(db, lambda d=att["dispatch_id"]: orca_raw(
+            "orchestration", "worker-stop", "--dispatch", d, timeout=60))
+        if not ok:
+            unstopped.append({"dispatch_id": att["dispatch_id"], "error": data.get("error")})
+            continue
+        db.execute("UPDATE attempts SET status='abandoned' WHERE dispatch_id=?", (att["dispatch_id"],))
+        log_event(db, "attempt", att["dispatch_id"], "cancelled", {"reason": intent["reason"]})
+        stopped.append(att["dispatch_id"])
+    if unstopped:
+        # The task stays visible to sweep, which only finishes the cancel and never resumes the work.
+        return {"task_id": a.task, "stage": task["stage"], "cancelled": False, "stopped": stopped,
+                "unstopped": unstopped, "exit_code": 1,
+                "next": f"check each worker with `orca orchestration worker-show --dispatch <id>`, then run"
+                        f" cancel --task {a.task} again"}
+    result = f"cancelled (by {intent['by']}): {intent['reason']}"
+    set_stage(db, a.task, "closed", tuple(s for s in NEXT if s != "merged"),
+              {"cancelled_by": intent["by"], "reason": intent["reason"], "answer": intent["answer"],
+               "stopped": stopped})
+    failed = _mark_orca_cancelled(db, task, [t for t in (task["merge_task_id"], a.task) if t], result)
+    return {"task_id": a.task, "stage": "closed", "cancelled": True, "stopped": stopped, "orca_pending": failed,
+            "branch_kept": (_freshness(db, task) or {}).get("branch")}
+
+
+def _cancel_intent(db, task_id: str) -> dict | None:
+    """The first recorded cancel decision for a task: who dropped it and why. Retries never replace it."""
+    row = db.execute("SELECT evidence_json FROM events WHERE entity_type='task' AND entity_id=?"
+                     " AND transition='cancel_requested' ORDER BY event_id LIMIT 1", (task_id,)).fetchone()
+    return json.loads(row["evidence_json"]) if row else None
 
 
 def _git_common_dir(path: str) -> str:
@@ -1636,21 +1788,79 @@ def attention_rows(db) -> tuple[list[dict], list[str]]:
                 if (w.get("projection") or {}).get("attention", {}).get("requiresAction") \
                         and live.get("verdict") == "exited":
                     prio, hint = 3, "worker exited without worker_done: run `orca-lifecycle.py recover`"
-        last = latest_attempt(db, t["task_id"])
-        dispatch = last["dispatch_id"] if last else "<dispatch>"
         rows.append({"priority": prio, "kind": "task", "task_id": t["task_id"], "run_id": t["run_id"],
-                     "stage": t["stage"], "detail": detail,
-                     "next": hint.format(t=t["task_id"], d=dispatch, r=t["run_id"], kind=t["kind"],
-                                         b=(last["branch"] if last else None) or "<branch>",
-                                         finish="merge" if t["kind"] == "code" else "accept",
-                                         retry=_retry_hint(t))})
+                     "stage": t["stage"], "detail": detail, "next": _format_hint(db, t, hint)})
     rows.sort(key=lambda r: (r["priority"], r["task_id"] or ""))
     return rows, errors
+
+
+def _format_hint(db, t: sqlite3.Row, hint: str) -> str:
+    last = latest_attempt(db, t["task_id"])
+    return hint.format(t=t["task_id"], d=last["dispatch_id"] if last else "<dispatch>", r=t["run_id"],
+                       kind=t["kind"], b=(last["branch"] if last else None) or "<branch>",
+                       finish="merge" if t["kind"] == "code" else "accept", retry=_retry_hint(t))
 
 
 def cmd_status(db, a) -> dict:
     rows, errors = attention_rows(db)
     return {"generated_at": iso(now()), "rows": rows, "errors": errors}
+
+
+def cmd_sweep(db, a) -> dict:
+    """Every open task that nobody touched for --min-idle-hours, with its exact next step.
+
+    Nothing is dropped silently: a task leaves the list only when it is closed (merged and captured, accepted, or
+    cancelled with `cancel`). --precheck is read-only and exits 0 when there is a leftover, 1 when there is none,
+    so an Orca automation can skip the run."""
+    recovery = None if a.precheck else cmd_recover(db, a)
+    cutoff = now() - dt.timedelta(hours=a.min_idle_hours)
+    leftovers = []
+    repo_dir = _git_common_dir(a.repo) if a.repo else None
+    for t in db.execute("SELECT * FROM tasks ORDER BY updated_at").fetchall():
+        if repo_dir and _git_common_dir(get_project(db, t["project_id"])["repo_path"]) != repo_dir:
+            continue
+        if t["stage"] == "closed":
+            pending = _cancel_pending(db, t["task_id"])
+            if pending:  # cancelled here, but Orca still shows these Tasks open: no idle cutoff
+                ids = pending["orca_tasks"]
+                leftovers.append({"task_id": t["task_id"], "run_id": t["run_id"], "stage": "closed",
+                                  "title": t["title"], "idle_since": t["updated_at"], "orca_pending": ids,
+                                  "next": f"orca-lifecycle.py cancel --task {t['task_id']} --by <name> --reason"
+                                          f" retry   (marks {', '.join(ids)} cancelled with the original reason)"})
+            continue
+        requested = db.execute("SELECT evidence_json FROM events WHERE entity_type='task' AND entity_id=?"
+                               " AND transition='cancel_requested' ORDER BY event_id DESC LIMIT 1",
+                               (t["task_id"],)).fetchone()
+        if requested:  # the owner already dropped it: finish the cancel, never the work; no idle cutoff
+            why = json.loads(requested["evidence_json"])
+            leftovers.append({"task_id": t["task_id"], "run_id": t["run_id"], "stage": t["stage"],
+                              "title": t["title"], "idle_since": t["updated_at"], "cancel_requested": why,
+                              "next": f"orca-lifecycle.py cancel --task {t['task_id']} --by {why['by']} --reason"
+                                      f" {shlex.quote(why['reason'])}   (stop the remaining worker; do not resume)"})
+            continue
+        if parse_time(t["updated_at"]) > cutoff:
+            continue
+        prio, hint = NEXT[t["stage"]]
+        if t["stage"] == "merged" and _pending_sot(db, t["task_id"]):
+            hint = "update the live SoT docs, then `orca-lifecycle.py sot-done --task {t} --file <doc>`"
+        row = {"task_id": t["task_id"], "run_id": t["run_id"], "stage": t["stage"], "title": t["title"],
+               "idle_since": t["updated_at"]}
+        if not a.precheck and t["kind"] == "code":
+            fresh = _freshness(db, t)
+            if fresh:
+                row.update(branch=fresh["branch"], behind_base=fresh["behind"], uncommitted=fresh["dirty"])
+                if t["stage"] == "verifying" and fresh["dirty"]:
+                    hint = ("the worker worktree has uncommitted changes: commit them on {b} (or ask the worker),"
+                            " then verify")
+                elif t["stage"] == "verifying" and fresh["behind"]:
+                    hint = "orca-lifecycle.py sync --task {t}, then rerun the tests and verify"
+        row["next"] = _format_hint(db, t, hint)
+        leftovers.append(row)
+    out = {"generated_at": iso(now()), "min_idle_hours": a.min_idle_hours, "leftovers": leftovers,
+           "recovery": recovery}
+    if a.precheck:
+        out["exit_code"] = 0 if leftovers else 1
+    return out
 
 
 def cmd_reload(db, a) -> dict:
@@ -1818,6 +2028,21 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--question", required=True)
     s.add_argument("--body", required=True)
 
+    s = sub.add_parser("sync", help="merge the current base into a verifying worker branch (conflict -> rework)")
+    s.add_argument("--task", required=True)
+
+    s = sub.add_parser("cancel", help="drop a task on the owner's word; keeps its branch, stops its worker")
+    s.add_argument("--task", required=True)
+    s.add_argument("--by", required=True)
+    s.add_argument("--reason", required=True)
+    s.add_argument("--answer", help="the owner's verbatim words, for the audit trail")
+
+    s = sub.add_parser("sweep", help="list every idle open task with its next step (for the 48 h automation)")
+    s.add_argument("--min-idle-hours", type=float, default=24)
+    s.add_argument("--precheck", action="store_true",
+                   help="read-only; exit 0 when a leftover exists, 1 when none (Orca automation precheck)")
+    s.add_argument("--repo", help="only tasks of projects in this git repo (any checkout or worktree of it)")
+
     sub.add_parser("recover", help="reconcile attempts with expired leases")
     s = sub.add_parser("status", help="attention queue")
     s.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
@@ -1835,6 +2060,7 @@ COMMANDS = {
     "merge": cmd_merge, "accept": cmd_accept, "capture": cmd_capture, "sot-done": cmd_sot_done,
     "answer": cmd_answer, "gate": cmd_gate, "discard": cmd_discard,
     "recover": cmd_recover, "status": cmd_status, "reload": cmd_reload,
+    "sync": cmd_sync, "cancel": cmd_cancel, "sweep": cmd_sweep,
 }
 
 

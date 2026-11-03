@@ -66,6 +66,10 @@ STUB = textwrap.dedent(
             state.setdefault("acked", []).append(opt("--ack"))
         inbox = state.setdefault("inbox", [])
         result = inbox.pop(0) if inbox else {"messages": [], "count": 0, "deliveryId": None}
+    elif verb == "orchestration task-update" and opt("--id") in state.get("fail_task_update", []):
+        json.dump(state, open(state_path, "w"))
+        print(json.dumps({"ok": False, "error": {"code": "conflict"}}))
+        sys.exit(1)
     elif verb == "orchestration task-update":
         for t in state.get("tasks", []):
             if t["id"] == opt("--id"):
@@ -83,6 +87,11 @@ STUB = textwrap.dedent(
             print(json.dumps({"ok": False, "error": {"code": "runtime_unreachable"}}))
             sys.exit(1)
         result = {"workers": state.get("workers", []), "page": {}}
+    elif verb == "orchestration worker-stop" and (state.get("fail_worker_stop") is True
+                                                   or opt("--dispatch") in (state.get("fail_worker_stop") or [])):
+        json.dump(state, open(state_path, "w"))
+        print(json.dumps({"ok": False, "error": {"code": "stop_unconfirmed"}}))
+        sys.exit(1)
     elif verb == "orchestration gate-list":
         result = {"gates": [g for g in state.get("gates", [])
                             if (not opt("--status") or g["status"] == opt("--status"))
@@ -433,6 +442,7 @@ def test_sot_changes_keep_the_task_open_until_the_live_documents_are_updated(env
     (repo / "Product" / "overview.md").write_text("# Product\nOld.\n")
     git(repo, "add", ".")
     git(repo, "commit", "-qm", "sot docs")
+    git(project["wt"], "merge", "-q", "--no-edit", "main")  # the worker branch is current with main
     _merge_with_sot(env)
 
     out = jrun(env, "--now", "2100-01-01T00:00:00Z", "capture", "--task", "task_a")
@@ -1123,3 +1133,161 @@ def test_status_orders_question_then_approval_then_running(env, project):
     ]
     assert rows[0]["next"].startswith("orca-lifecycle.py answer --question msg_q")
     assert "approve --task task_b" in rows[1]["next"]
+
+
+def _advance_main(project, name="later.txt", text="later\n"):
+    (project["repo"] / name).write_text(text)
+    git(project["repo"], "add", name)
+    git(project["repo"], "commit", "-qm", f"main moves: {name}")
+
+
+def test_verify_refuses_a_branch_that_is_behind_the_base(env, project):
+    jrun(env, "ingest", stdin=batch(worker_done()))
+    _advance_main(project)
+
+    refused = run(env, "verify", "--task", "task_a", "--verdict", "pass", "--evidence", "ok", check=False)
+
+    assert refused.returncode == 2 and "1 commit(s) behind 'main'" in refused.stderr
+    assert "sync --task task_a" in refused.stderr and stage(env) == "verifying"
+
+
+def test_sync_brings_the_base_into_the_branch_so_verify_pins_the_merge_target(env, project):
+    jrun(env, "ingest", stdin=batch(worker_done()))
+    _advance_main(project)
+
+    out = jrun(env, "sync", "--task", "task_a")
+    pinned = jrun(env, "verify", "--task", "task_a", "--verdict", "pass", "--evidence", "ok")["reviewed_sha"]
+
+    assert out["merged_base"] == "main" and out["stage"] == "verifying"
+    assert (project["wt"] / "later.txt").read_text() == "later\n"
+    assert pinned == git(project["wt"], "rev-parse", "HEAD").strip()
+
+
+def test_sync_conflict_sends_the_task_to_rework_and_leaves_the_worktree_clean(env, project):
+    jrun(env, "ingest", stdin=batch(worker_done()))
+    _advance_main(project, "greet.txt", "bonjour\n")
+
+    out = jrun(env, "sync", "--task", "task_a")
+
+    assert out["stage"] == "rework" and out["conflicts"] == ["greet.txt"]
+    assert git(project["wt"], "status", "--porcelain") == "" and (project["wt"] / "greet.txt").read_text() == "hello\n"
+    assert "merge 'main' into feat/greeting" in out["next"]
+
+
+def test_verify_and_sync_refuse_uncommitted_work_in_the_worker_worktree(env, project):
+    jrun(env, "ingest", stdin=batch(worker_done()))
+    (project["wt"] / "greet.txt").write_text("hello, unsaved\n")
+
+    verify = run(env, "verify", "--task", "task_a", "--verdict", "pass", "--evidence", "ok", check=False)
+    sync = run(env, "sync", "--task", "task_a", check=False)
+
+    for proc in (verify, sync):
+        assert proc.returncode == 2 and "uncommitted" in proc.stderr and "greet.txt" in proc.stderr
+    assert (project["wt"] / "greet.txt").read_text() == "hello, unsaved\n"
+
+
+def test_cancel_closes_the_task_keeps_the_branch_and_tells_orca(env, project):
+    out = jrun(env, "cancel", "--task", "task_a", "--by", "owner", "--reason", "owner dropped greetings")
+
+    assert out["stage"] == "closed" and stage(env) == "closed"
+    assert git(project["repo"], "branch", "--list", "feat/greeting").strip()
+    calls = json.loads(env["state"].read_text())["calls"]
+    update = next(c for c in calls if c[:2] == ["orchestration", "task-update"])
+    assert update[update.index("--result") + 1].startswith("cancelled (by owner): owner dropped greetings")
+    assert any(c[:2] == ["orchestration", "worker-stop"] for c in calls)
+    assert run(env, "cancel", "--task", "task_a", "--by", "owner", "--reason", "again", check=False).returncode == 2
+
+
+def test_sweep_lists_every_idle_open_task_and_precheck_exits_on_leftovers(env, project):
+    jrun(env, "ingest", stdin=batch(worker_done()))
+    _advance_main(project)
+    later = ("--now", "2100-01-01T00:00:00Z")
+
+    out = jrun(env, *later, "sweep")
+    precheck = run(env, *later, "sweep", "--precheck", check=False)
+    fresh = run(env, "sweep", "--precheck", check=False)
+
+    (row,) = out["leftovers"]
+    assert row["task_id"] == "task_a" and row["stage"] == "verifying" and row["behind_base"] == 1
+    assert "sync --task task_a" in row["next"]
+    assert precheck.returncode == 0 and fresh.returncode == 1  # just updated: not idle yet
+    jrun(env, "cancel", "--task", "task_a", "--by", "owner", "--reason", "dropped")
+    assert run(env, *later, "sweep", "--precheck", check=False).returncode == 1
+
+
+def test_cancel_keeps_the_task_open_while_orca_cannot_stop_its_worker(env, project):
+    state = json.loads(env["state"].read_text())
+    state["fail_worker_stop"] = True
+    env["state"].write_text(json.dumps(state))
+
+    proc = run(env, "cancel", "--task", "task_a", "--by", "owner", "--reason", "dropped", check=False)
+
+    out = json.loads(proc.stdout)
+    assert proc.returncode == 1 and out["cancelled"] is False and stage(env) == "implementing"
+    assert [u["dispatch_id"] for u in out["unstopped"]] == ["ctx_1"]
+    later = jrun(env, "--now", "2100-01-01T00:00:00Z", "sweep", "--precheck")
+    assert [r["task_id"] for r in later["leftovers"]] == ["task_a"]  # still visible, so cancel can be retried
+
+
+def test_sweep_repo_filter_keeps_only_that_repos_tasks(env, project):
+    other = env["tmp"] / "other"
+    other.mkdir()
+    git(other, "init", "-q", "-b", "main")
+    later = ("--now", "2100-01-01T00:00:00Z")
+
+    mine = jrun(env, *later, "sweep", "--precheck", "--repo", str(project["wt"]))  # a worktree of the repo counts
+    theirs = run(env, *later, "sweep", "--precheck", "--repo", str(other), check=False)
+
+    assert [r["task_id"] for r in mine["leftovers"]] == ["task_a"] and theirs.returncode == 1
+
+
+def test_cancel_retries_only_the_orca_tasks_left_pending_until_none_are(env, project):
+    db = sqlite3.connect(env["env"]["ORCA_LIFECYCLE_DB"])
+    db.execute("UPDATE tasks SET merge_task_id='merge_a' WHERE task_id='task_a'")
+    db.commit()
+    state = json.loads(env["state"].read_text())
+    state["fail_task_update"] = ["task_a"]  # the merge Task update succeeds, the parent's fails
+    env["state"].write_text(json.dumps(state))
+
+    first = jrun(env, "cancel", "--task", "task_a", "--by", "owner", "--reason", "dropped")
+    listed = jrun(env, "sweep", "--precheck")["leftovers"]  # no idle wait for a pending cancel
+
+    assert first["stage"] == "closed" and first["orca_pending"] == ["task_a"]
+    assert [(r["task_id"], r["orca_pending"]) for r in listed] == [("task_a", ["task_a"])]
+    state = json.loads(env["state"].read_text())
+    state["fail_task_update"] = []
+    env["state"].write_text(json.dumps(state))
+    second = jrun(env, "cancel", "--task", "task_a", "--by", "coordinator", "--reason", "retry")
+    assert second["orca_pending"] == [] and run(env, "sweep", "--precheck", check=False).returncode == 1
+    updates = [(c[c.index("--id") + 1], c[c.index("--result") + 1]) for c in
+               json.loads(env["state"].read_text())["calls"] if c[:2] == ["orchestration", "task-update"]]
+    original = "cancelled (by owner): dropped"
+    assert updates == [("merge_a", original), ("task_a", original), ("task_a", original)]  # only what was pending
+    assert run(env, "cancel", "--task", "task_a", "--by", "owner", "--reason", "x", check=False).returncode == 2
+
+
+def test_cancel_keeps_confirmed_stops_and_the_owner_reason_when_one_worker_will_not_stop(env, project):
+    run(env, "attempt", "--task", "task_a", "--dispatch", "ctx_2", "--branch", "feat/greeting", check=False)
+    db = sqlite3.connect(env["env"]["ORCA_LIFECYCLE_DB"])
+    db.execute("INSERT INTO attempts (dispatch_id, task_id, branch, lease_expires_at, status, created_at)"
+               " VALUES ('ctx_2', 'task_a', 'feat/greeting', '2100-01-01T00:00:00Z', 'active', '2026-01-01T00:00:00Z')")
+    db.commit()
+    state = json.loads(env["state"].read_text())
+    state["fail_worker_stop"] = ["ctx_2"]
+    env["state"].write_text(json.dumps(state))
+
+    first = json.loads(run(env, "cancel", "--task", "task_a", "--by", "owner", "--reason", "dropped",
+                           check=False).stdout)
+    statuses = dict(sqlite3.connect(env["env"]["ORCA_LIFECYCLE_DB"]).execute(
+        "SELECT dispatch_id, status FROM attempts WHERE task_id='task_a'").fetchall())
+    (row,) = jrun(env, "sweep", "--precheck")["leftovers"]  # no idle wait once the owner dropped it
+
+    assert first["stopped"] == ["ctx_1"] and statuses == {"ctx_1": "abandoned", "ctx_2": "active"}
+    assert row["cancel_requested"]["reason"] == "dropped" and "do not resume" in row["next"]
+    state = json.loads(env["state"].read_text())
+    state["fail_worker_stop"] = []
+    env["state"].write_text(json.dumps(state))
+    done = jrun(env, "cancel", "--task", "task_a", "--by", "coordinator", "--reason", "retry")
+    assert done["stopped"] == ["ctx_2"] and stage(env) == "closed"
+    result = [c for c in json.loads(env["state"].read_text())["calls"] if c[:2] == ["orchestration", "task-update"]][-1]
+    assert result[result.index("--result") + 1] == "cancelled (by owner): dropped"
