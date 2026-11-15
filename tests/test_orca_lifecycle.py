@@ -6,6 +6,7 @@ for the Orca runtime, so these tests prove the registry state machine, not Orca.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import sqlite3
@@ -43,6 +44,17 @@ STUB = textwrap.dedent(
         result = {"worktrees": state.get("orca_worktrees", [])}
     elif verb == "worktree create":
         result = {"worktree": {"id": "repo::" + os.environ["ORCA_STUB_WORKTREE"]}}
+    elif verb == "worktree ps":
+        # Every git worktree in the test folder, listed by Orca; `live_terminals` paths keep a live terminal.
+        root = os.path.dirname(state_path)
+        result = {"truncated": False, "worktrees": [
+            {"path": os.path.join(root, d), "liveTerminalCount": int(os.path.join(root, d) in state.get(
+                "live_terminals", [])), "unverifiableTerminalCount": 0, "hasAttachedPty": False}
+            for d in sorted(os.listdir(root)) if os.path.exists(os.path.join(root, d, ".git"))]}
+    elif verb == "terminal close" and state.get("fail_terminal_close"):
+        json.dump(state, open(state_path, "w"))
+        print(json.dumps({"ok": False, "error": {"code": "runtime_unreachable"}}))
+        sys.exit(1)
     elif verb == "terminal create":
         result = {"terminal": {"handle": "term_stub"}}
     elif verb == "terminal read":
@@ -52,17 +64,35 @@ STUB = textwrap.dedent(
                                        ["   ⎋ Reading files", "╰─                                ─╯"]}}
     elif verb == "orchestration worker-start":
         task = next(t for t in state["tasks"] if t["id"] == opt("--task"))
+        nested = state.pop("nested", None)
+        if nested:  # a second lifecycle command while this launch runs with the registry lock released
+            import subprocess
+            json.dump(state, open(state_path, "w"))
+            p = subprocess.run(nested, capture_output=True, text=True)
+            state = json.load(open(state_path))
+            state.setdefault("nested_results", []).append([p.returncode, p.stderr])
+            task = next(t for t in state["tasks"] if t["id"] == opt("--task"))
+        import sqlite3  # what a concurrent start would see in the registry while this launch runs
+        state["slots_at_launch"] = dict(sqlite3.connect(os.environ["ORCA_LIFECYCLE_DB"]).execute(
+            "SELECT worktree_path, state || ':' || task_id FROM slots").fetchall())
         retry = opt("--retry-of")
         allowed = task.get("status") in (("failed", "blocked") if retry else ("ready",))
-        if not allowed or not (opt("--name") or opt("--terminal")) or state.get("fail_worker_start"):
+        selector = opt("--worktree")
+        # A new worktree needs --name (or an adopted terminal); Orca rejects creation flags for an existing one.
+        flags_ok = (bool(opt("--name") or opt("--terminal")) if selector.startswith("new-") else
+                    not any(f in args for f in ("--name", "--repo", "--base-branch", "--setup")))
+        if not allowed or not flags_ok or state.get("fail_worker_start"):
+            json.dump(state, open(state_path, "w"))
             print(json.dumps({"ok": False, "error": {"code": "invalid_argument"},
                               "result": {"failedStage": "accepted", "residualResources": []}}))
             sys.exit(1)
         n = len(state.setdefault("dispatches", [])) + 1
         state["dispatches"].append(opt("--task"))
         task["status"] = "dispatched"
+        path = (os.environ["ORCA_STUB_WORKTREE"] if selector.startswith("new-") else
+                selector.removeprefix("path:").removeprefix("id:").split("::")[-1])
         result = {"dispatchId": f"ctx_new{n}", "state": "ready", "effects": [
-            {"kind": "worktree", "action": "created_child", "id": "repo::" + os.environ["ORCA_STUB_WORKTREE"]}]}
+            {"kind": "worktree", "action": "created_child", "id": "repo::" + path}]}
     elif verb == "orchestration check":
         if "--ack" in args:
             state.setdefault("acked", []).append(opt("--ack"))
@@ -117,6 +147,8 @@ def env(tmp_path):
         "ORCA_STUB_STATE": str(state),
         "ORCA_ORCHESTRATION_DB": str(tmp_path / "missing-orca.db"),
         "ORCA_STUB_WORKTREE": str(tmp_path / "wt"),
+        "ORCA_OMP_SESSIONS_DIR": str(tmp_path / "omp-sessions"),
+        "ORCA_SLOT_CONTEXT_DIR": str(tmp_path / "slot-context"),
         "ORCA_LIFECYCLE_OMP_OVERLAY": str(tmp_path / "noplan.yml"),
         "ORCA_OMP_FRESH_CONFIG": str(tmp_path / "fresh.yml"),
         "ORCA_OMP_STATUS_EXTENSION": str(tmp_path / "status.ts"),
@@ -169,8 +201,8 @@ def project(env):
 
 
 def worker_done(body="Added greet.txt. It prints hello. Nothing is left.", outcome="succeeded",
-                dispatch="ctx_1"):
-    payload = json.dumps({"taskId": "task_a", "dispatchId": dispatch, "outcome": outcome})
+                dispatch="ctx_1", task="task_a"):
+    payload = json.dumps({"taskId": task, "dispatchId": dispatch, "outcome": outcome})
     return {"id": f"msg_{abs(hash(body)) % 10**6}", "type": "worker_done", "subject": "done",
             "body": body, "payload": payload}
 
@@ -690,6 +722,323 @@ def _calls(env, verb):
     return [c for c in json.loads(env["state"].read_text()).get("calls", []) if c[:2] == ["orchestration", verb]]
 
 
+def _all_calls(env):
+    return json.loads(env["state"].read_text()).get("calls", [])
+
+
+def _new_task(env, task_id, title):
+    state = json.loads(env["state"].read_text())
+    state["tasks"].append({"id": task_id, "task_title": title, "status": "ready"})
+    env["state"].write_text(json.dumps(state))
+
+
+def _start(env, task_id, *flags, agent="claude", check=True):
+    args = ("start-worker", "--task", task_id, "--project", "acme/demo", "--run", "run_1", "--acceptance", "x",
+            "--class", "small", "--agent", agent, *flags)
+    return jrun(env, *args) if check else run(env, *args, check=False)
+
+
+def _slots(env):
+    return {Path(s["path"]).name: s for s in jrun(env, "--json", "pool")["slots"]}
+
+
+def _head(path, ref="HEAD"):
+    return git(path, "rev-parse", ref).strip()
+
+
+def _merge_task(env, project, task, title, wt_name, at):
+    """Track a second task with its own worktree and commit, then take it through to merge at time `at`."""
+    _new_task(env, task, title)
+    wt = env["tmp"] / wt_name
+    git(project["repo"], "worktree", "add", "-q", "-b", f"feat/{wt_name}", str(wt), "main")
+    (wt / f"{wt_name}.txt").write_text(f"{title}\n")
+    git(wt, "add", ".")
+    git(wt, "commit", "-qm", title)
+    run(env, "--now", at, "track", "--task", task, "--run", "run_1", "--project", "acme/demo", "--acceptance", "x",
+        "--title", title)
+    run(env, "--now", at, "attempt", "--task", task, "--dispatch", f"ctx_{task}", "--worktree-path", str(wt))
+    jrun(env, "--now", at, "ingest", stdin=batch(worker_done(body=f"{title}. Done.", dispatch=f"ctx_{task}",
+                                                             task=task), delivery=f"dlv_{task}"))
+    jrun(env, "--now", at, "verify", "--task", task, "--verdict", "pass", "--evidence", "ok")
+    for kind in ("judge", "board"):
+        jrun(env, "--now", at, "review", "--task", task, "--kind", kind, "--verdict", "pass", "--evidence", "ok")
+    jrun(env, "--now", at, "approve", "--task", task, "--by", "owner", "--answer", "Approve")
+    jrun(env, "--now", at, "merge", "--task", task)
+    return wt
+
+
+def _omp_session(env, worktree, stamp):
+    """A recorded OMP transcript whose working folder is `worktree`, named the way OMP names it."""
+    p = Path(worktree)
+    rel = p.relative_to(Path.home()) if p.is_relative_to(Path.home()) else p.relative_to("/")
+    folder = Path(env["env"]["ORCA_OMP_SESSIONS_DIR"]) / ("-" + str(rel).replace("/", "-"))
+    folder.mkdir(parents=True, exist_ok=True)
+    f = folder / f"{stamp}_019f.jsonl"
+    f.write_text(json.dumps({"type": "title"}) + "\n" + json.dumps({"type": "session", "cwd": str(worktree)}) + "\n")
+    return f
+
+
+def _omp_command(env):
+    create = next(c for c in _all_calls(env) if c[:2] == ["terminal", "create"])
+    return create[create.index("--command") + 1]
+
+
+def test_reused_slot_worker_gets_the_earlier_task_in_its_system_prompt(env, project):
+    _merge(env)
+    old = _omp_session(env, project["wt"], "2000-01-01T00-00-00-000Z")  # before task_a: not its transcript
+    recorded = sqlite3.connect(env["env"]["ORCA_LIFECYCLE_DB"]).execute(
+        "SELECT created_at FROM attempts WHERE task_id='task_a'").fetchone()[0]
+    started = dt.datetime.strptime(recorded, "%Y-%m-%dT%H:%M:%SZ") - dt.timedelta(minutes=1)
+    # OMP opens the worker's session during the launch, before the lifecycle records the attempt
+    recent = _omp_session(env, project["wt"], started.strftime("%Y-%m-%dT%H-%M-%S-000Z"))
+    _new_task(env, "task_b", "Add farewell")
+
+    out = _start(env, "task_b", agent="omp")
+
+    command = _omp_command(env)
+    assert f"--append-system-prompt {out['slot_context']}" in command and "--resume" not in command
+    context = Path(out["slot_context"]).read_text()
+    for fact in ("task_a", "Add greeting", "Greetings stay in plain text files.", str(recent)):
+        assert fact in context
+    assert str(old) not in context
+
+
+def test_resume_continues_the_newest_session_recorded_in_the_slot(env, project):
+    _merge(env)
+    _omp_session(env, project["wt"], "2098-01-01T00-00-00-000Z")
+    recent = _omp_session(env, project["wt"], "2099-01-01T00-00-00-000Z")
+    _new_task(env, "task_b", "Add farewell")
+    refused = _start(env, "task_b", "--resume", check=False)  # claude cannot resume an OMP session
+    assert refused.returncode == 2 and "--agent omp" in refused.stderr
+
+    _start(env, "task_b", "--resume", agent="omp")
+
+    command = _omp_command(env)
+    assert f"--resume {recent}" in command and "--append-system-prompt" not in command
+
+
+@pytest.mark.parametrize("include, present", [((), False), (("--include", "/media/"), True)])
+def test_worker_worktrees_skip_the_paths_the_repo_excludes(env, project, include, present):
+    _merge(env)
+    (project["repo"] / "media").mkdir()
+    (project["repo"] / "media" / "talk.mov").write_text("big\n")
+    (project["repo"] / "docs").mkdir()
+    (project["repo"] / "docs" / "deck.pdf").write_text("big\n")
+    git(project["repo"], "add", "media", "docs")
+    git(project["repo"], "commit", "-qm", "media")
+    (project["repo"] / ".orca-sparse-exclude").write_text("# heavy files\n/media/\n*.pdf\n")
+    _new_task(env, "task_b", "Add farewell")
+    _new_task(env, "task_c", "Write chores")
+    fresh = env["tmp"] / "wt_new"
+    git(project["repo"], "worktree", "add", "-q", "-b", "feat/new", str(fresh), "main")
+    env["env"]["ORCA_STUB_WORKTREE"] = str(fresh)
+
+    _start(env, "task_b", *include, agent="omp")              # reuses wt
+    _start(env, "task_c", "--slot", "new", *include, agent="omp")  # Orca creates wt_new
+    _new_task(env, "task_d", "Write notes")
+    refused = _start(env, "task_d", "--slot", "new", check=False)  # claude: Orca would start it before sparse
+    assert refused.returncode == 2 and ".orca-sparse-exclude" in refused.stderr
+    assert len(_calls(env, "worker-start")) == 2
+
+    for wt in (project["wt"], fresh):
+        assert (wt / "media" / "talk.mov").exists() is present and (wt / "greet.txt").exists()
+        assert not (wt / "docs" / "deck.pdf").exists()  # a glob pattern applies at every depth
+        assert not git(wt, "status", "--porcelain").strip()
+
+
+def test_merge_returns_the_clean_worktree_to_the_pool_detached_at_base(env, project):
+    _merge(env)
+
+    slot = _slots(env)["wt"]
+    assert slot["state"] == "free" and slot["last_task"] == "task_a"
+    assert _head(project["wt"]) == _head(project["repo"], "main")
+    assert subprocess.run(["git", "-C", str(project["wt"]), "symbolic-ref", "-q", "HEAD"]).returncode == 1
+    assert git(project["repo"], "branch", "--list", "feat/greeting").strip()  # the branch is kept
+    assert ["terminal", "close", "--worktree", f"path:{project['wt']}", "--all"] in _all_calls(env)
+
+
+@pytest.mark.parametrize("agent", ["claude", "omp"])
+def test_new_task_starts_in_a_free_slot_on_a_new_branch_from_base(env, project, agent):
+    _merge(env)
+    _new_task(env, "task_b", "Add farewell")
+
+    out = _start(env, "task_b", agent=agent)
+
+    (start,) = _calls(env, "worker-start")
+    assert start[start.index("--worktree") + 1] == f"path:{project['wt']}"
+    assert not {"--name", "--repo", "--base-branch", "--setup"} & set(start)
+    assert not [c for c in _all_calls(env) if c[:2] == ["worktree", "create"]]
+    assert out["branch"] == git(project["wt"], "branch", "--show-current").strip() == "add-farewell-task_b-a1"
+    assert _head(project["wt"]) == _head(project["repo"], "main")
+    slot = _slots(env)["wt"]
+    assert slot["state"] == "busy" and slot["task"] == "task_b"
+    assert _board(env, project["wt"])[-1] == "in-progress"
+
+
+@pytest.mark.parametrize("title, flags, expected", [
+    ("Translate greeting", (), "wt"),          # shares a word with the earlier task in wt
+    ("Write chores", (), "wtc"),               # nothing similar: the most recently freed slot
+    ("Write chores", ("--slot", "wt"), "wt"),  # the triage agent's explicit choice wins
+])
+def test_similar_slot_wins_over_the_most_recent_and_slot_flag_overrides(env, project, title, flags, expected):
+    _merge(env)  # wt: "Add greeting", freed now
+    _merge_task(env, project, "task_c", "Migrate database", "wtc", "2099-01-01T00:00:00Z")  # freed later
+    _new_task(env, "task_d", title)
+    flags = tuple(str(env["tmp"] / f) if f == "wt" else f for f in flags)
+
+    _start(env, "task_d", *flags)
+
+    (start,) = _calls(env, "worker-start")
+    assert start[start.index("--worktree") + 1] == f"path:{env['tmp'] / expected}"
+
+
+def test_dirty_worktree_stays_out_of_the_pool(env, project):
+    (project["wt"] / "scratch.txt").write_text("unreviewed\n")
+    _merge(env)
+    assert _slots(env)["wt"]["state"] == "kept"
+    _new_task(env, "task_b", "Add farewell")
+
+    _start(env, "task_b")
+
+    (start,) = _calls(env, "worker-start")
+    assert start[start.index("--worktree") + 1] == "new-child"
+    assert (project["wt"] / "scratch.txt").exists()
+
+
+def test_start_worker_refuses_a_new_worktree_at_the_pool_cap(env, project):
+    env["env"]["ORCA_POOL_CAP"] = "1"  # wt is busy with task_a
+    _new_task(env, "task_b", "Add farewell")
+
+    proc = _start(env, "task_b", check=False)
+
+    assert proc.returncode == 2 and "pool" in proc.stderr and "1 of 1" in proc.stderr
+    assert _calls(env, "worker-start") == []
+
+
+def test_release_returns_a_slot_only_when_its_task_has_no_running_worker(env, project):
+    refused = run(env, "pool", "--release", str(project["wt"]), check=False)
+    assert refused.returncode == 2 and "task_a" in refused.stderr
+
+    jrun(env, "ingest", stdin=batch(worker_done(outcome="failed")))
+    jrun(env, "pool", "--release", str(project["wt"]))
+
+    assert _slots(env)["wt"]["state"] == "free"
+    assert _head(project["wt"]) == _head(project["repo"], "main")
+    assert git(project["repo"], "branch", "--list", "feat/greeting").strip()
+
+
+def test_a_failed_start_keeps_the_slot_reserved_and_its_branch_for_the_same_task(env, project):
+    _merge(env)
+    _new_task(env, "task_b", "Add farewell")
+    _new_task(env, "task_c", "Add farewell banner")
+    state = json.loads(env["state"].read_text())
+    state["fail_worker_start"] = True
+    env["state"].write_text(json.dumps(state))
+
+    assert _start(env, "task_b", check=False).returncode == 1
+
+    # reserved before the launch released the registry lock, so a concurrent start could not pick it
+    assert json.loads(env["state"].read_text())["slots_at_launch"][str(project["wt"])] == "busy:task_b"
+    assert _slots(env)["wt"]["task"] == "task_b"
+    # a partial launch may already work there: the branch stays
+    assert git(project["wt"], "branch", "--show-current").strip() == "add-farewell-task_b-a1"
+    other = env["tmp"] / "wt_other"
+    git(project["repo"], "worktree", "add", "-q", "-b", "feat/other", str(other), "main")
+    env["env"]["ORCA_STUB_WORKTREE"] = str(other)
+    state = json.loads(env["state"].read_text())
+    state["fail_worker_start"] = False
+    env["state"].write_text(json.dumps(state))
+
+    _start(env, "task_c")  # a similar task never takes task_b's reserved slot
+    _start(env, "task_b")  # task_b continues there on the same branch
+
+    c_start, b_start = _calls(env, "worker-start")[-2:]
+    assert c_start[c_start.index("--worktree") + 1] == "new-child"
+    assert b_start[b_start.index("--worktree") + 1] == f"path:{project['wt']}"
+    assert git(project["wt"], "branch", "--show-current").strip() == "add-farewell-task_b-a1"
+
+
+def _stub(env, **changes):
+    state = json.loads(env["state"].read_text())
+    state.update(changes)
+    env["state"].write_text(json.dumps(state))
+
+
+@pytest.mark.parametrize("second", ["start", "release"])
+def test_a_second_command_during_a_launch_leaves_that_launch_alone(env, project, second):
+    _merge(env)
+    _new_task(env, "task_b", "Add farewell")
+    cmd = (["start-worker", "--task", "task_b", "--class", "small", "--agent", "claude"] if second == "start"
+           else ["pool", "--release", str(project["wt"])])
+    _stub(env, nested=[sys.executable, str(CLI), *cmd])  # runs inside the first launch's worker-start
+
+    _start(env, "task_b")
+
+    ((code, err),) = json.loads(env["state"].read_text())["nested_results"]
+    assert code == 2 and ("still launching" in err or "being started" in err)
+    calls = _all_calls(env)
+    launch = calls.index(next(c for c in calls if c[:2] == ["orchestration", "worker-start"]))
+    assert not [c for c in calls[launch:] if c[:2] == ["terminal", "close"]]  # the first worker was not closed
+    assert len(_calls(env, "worker-start")) == 1
+    slot = _slots(env)["wt"]
+    assert slot["state"] == "busy" and slot["task"] == "task_b"
+    assert git(project["wt"], "branch", "--show-current").strip() == "add-farewell-task_b-a1"
+
+
+def test_merge_keeps_a_worktree_with_a_surviving_terminal_out_of_the_pool(env, project):
+    _stub(env, live_terminals=[str(project["wt"])])
+
+    _merge(env)
+
+    assert stage(env) == "merged"  # the lifecycle finishes; only the parking waits
+    assert _slots(env)["wt"]["state"] == "kept"
+    assert git(project["wt"], "branch", "--show-current").strip() == "feat/greeting"  # checkout untouched
+
+
+def test_cancel_after_a_partial_launch_never_switches_a_live_checkout(env, project):
+    _merge(env)
+    _new_task(env, "task_b", "Add farewell")
+    _stub(env, fail_worker_start=True)
+    assert _start(env, "task_b", check=False).returncode == 1  # reserved, no attempt recorded
+    _stub(env, live_terminals=[str(project["wt"])])
+
+    out = jrun(env, "cancel", "--task", "task_b", "--by", "owner", "--reason", "dropped")
+
+    assert out["stage"] == "closed" and out["pool"] == {str(project["wt"]): "kept"}
+    assert git(project["wt"], "branch", "--show-current").strip() == "add-farewell-task_b-a1"
+
+
+@pytest.mark.parametrize("trouble", [{"fail_terminal_close": True}, {"live_terminals": "wt"}])
+def test_reuse_refuses_until_orca_confirms_no_worker_runs_in_the_slot(env, project, trouble):
+    _merge(env)
+    _new_task(env, "task_b", "Add farewell")
+    _stub(env, **{k: [str(project["wt"])] if v == "wt" else v for k, v in trouble.items()})
+
+    proc = _start(env, "task_b", check=False)
+
+    assert proc.returncode == 2 and "no worker runs" in proc.stderr
+    assert _calls(env, "worker-start") == []
+    assert _slots(env)["wt"]["state"] == "free"  # not reserved, not switched
+    assert subprocess.run(["git", "-C", str(project["wt"]), "symbolic-ref", "-q", "HEAD"]).returncode == 1
+
+
+def test_release_after_a_partial_launch_waits_until_its_terminals_are_gone(env, project):
+    _merge(env)
+    _new_task(env, "task_b", "Add farewell")
+    _stub(env, fail_worker_start=True)
+    assert _start(env, "task_b", check=False).returncode == 1  # Orca may have left a terminal running there
+    _stub(env, live_terminals=[str(project["wt"])])
+
+    refused = run(env, "pool", "--release", str(project["wt"]), check=False)
+
+    assert refused.returncode == 2 and "no worker runs" in refused.stderr
+    assert _slots(env)["wt"]["state"] == "busy"
+    _stub(env, live_terminals=[])
+    jrun(env, "pool", "--release", str(project["wt"]))
+    assert _slots(env)["wt"]["state"] == "free"
+    assert ["terminal", "close", "--worktree", f"path:{project['wt']}", "--all"] in _all_calls(env)[-3:]
+
+
 @pytest.mark.parametrize("orca_status, reopened, retry_of", [
     ("completed", True, None),
     ("failed", False, "ctx_1"),
@@ -707,16 +1056,19 @@ def test_start_worker_picks_the_start_orca_accepts(env, project, orca_status, re
     assert ("--retry-of" in start) is bool(retry_of)
     if retry_of:
         assert start[start.index("--retry-of") + 1] == retry_of
-    repo = git(project["repo"], "worktree", "list", "--porcelain").split("\n", 1)[0].removeprefix("worktree ")
-    for flag, value in (("--repo", f"path:{repo}"), ("--worktree", "new-child"), ("--base-branch", "main"),
-                        ("--name", "add-greeting-task_a-a2"), ("--run", "run_1")):
+    # Rework continues in the task's own worktree and branch; Orca takes no creation flags for it.
+    for flag, value in (("--worktree", f"path:{project['wt']}"), ("--run", "run_1")):
         assert start[start.index(flag) + 1] == value
+    assert not {"--name", "--repo", "--base-branch"} & set(start)
     assert out["dispatch_id"] == "ctx_new1" and out["branch"] == "feat/greeting"
     assert stage(env) == "implementing"
     # agents other than OMP keep the one-call agent-first start: no adopted terminal, no low-level launch calls
     assert "--terminal" not in start and start[start.index("--agent") + 1] == "claude"
     calls = json.loads(env["state"].read_text())["calls"]
-    assert not [c for c in calls if c[0] in ("worktree", "terminal") and c[:2] not in (["worktree", "set"], ["worktree", "list"])]
+    launch = [c[:2] for c in calls if c[0] in ("worktree", "terminal")
+              and c[:2] not in (["worktree", "set"], ["worktree", "list"])]
+    # close whatever the earlier worker left open, then confirm through Orca that nothing runs there
+    assert launch == [["terminal", "close"], ["worktree", "ps"]]
     assert '"class":"small"' in dict(events(env, "started"))["ctx_new1"]
     assert _board(env, project["wt"])[-1] == "in-progress"
 
@@ -752,7 +1104,7 @@ def _ready_for_restart(env):
 def test_omp_worker_never_starts_in_plan_mode(env, project, work_class):
     _ready_for_restart(env)
 
-    out = jrun(env, "start-worker", "--task", "task_a", "--class", work_class, "--agent", "omp")
+    out = jrun(env, "start-worker", "--task", "task_a", "--class", work_class, "--agent", "omp", "--slot", "new")
 
     calls = json.loads(env["state"].read_text())["calls"]
     launch = [c for c in calls if (c[0] in ("worktree", "terminal") and c[:2] not in (["worktree", "set"], ["worktree", "list"]))
@@ -1193,6 +1545,7 @@ def test_cancel_closes_the_task_keeps_the_branch_and_tells_orca(env, project):
 
     assert out["stage"] == "closed" and stage(env) == "closed"
     assert git(project["repo"], "branch", "--list", "feat/greeting").strip()
+    assert out["branch_kept"] == "feat/greeting" and _slots(env)["wt"]["state"] == "free"  # the worktree is reusable
     calls = json.loads(env["state"].read_text())["calls"]
     update = next(c for c in calls if c[:2] == ["orchestration", "task-update"])
     assert update[update.index("--result") + 1].startswith("cancelled (by owner): owner dropped greetings")

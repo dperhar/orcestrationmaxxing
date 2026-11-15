@@ -56,13 +56,17 @@ flowchart LR
 ```
 
 1. **Plan.** The coordinator classifies the request. Small work becomes one worker. Large work becomes tickets in `.scratch/<feature>/issues/`, and `Blocked by:` lines become task dependencies.
-2. **Dispatch.** `start-worker` creates the Orca task, a child worktree, and the worker terminal in one call. It appends the worker contract to the brief and records the attempt.
+2. **Dispatch.** `start-worker` creates the Orca task, a worker worktree, and the worker terminal in one call. It reuses a pooled worktree before it creates one (see below). It appends the worker contract to the brief and records the attempt.
 3. **Work.** The worker writes code through the `code-implementer` subagent and asks `worker-advisor` at decision points. It runs plain OMP, never plan mode, with no runtime advisor. It commits on its branch and sends `worker_done` exactly once.
 4. **Gate.** The coordinator runs `wait`, then three checks: `verify` (tests against the base branch), `judge` (code review), and `board` (scope and fit).
 5. **Ship.** If all three pass and the result matches what you asked for, the coordinator approves and merges without asking you. `merge` leaves your uncommitted files alone. It refuses only if the branch touches one of them or the merge conflicts. Merge and deploy are separate steps.
 6. **Remember.** `capture` appends `DECISION:` lines to the project's `decisions.md`. `SOT(area):` lines tell the coordinator which architecture, business, dev, or product docs to update before the task closes.
 
 The Orca board follows the lifecycle by itself: working is In progress, review is In review, rework is To Fix, and merged is Done.
+
+**Worktree pool.** A finished worker's worktree is not thrown away. After `merge`, `accept`, or `cancel`, the lifecycle closes its terminals (that frees the RAM), checks through `orca worktree ps` that nothing still runs there, and parks it clean on the base branch. The next task of the same project takes it, on a new branch: first the task's own worktree on rework, then `--slot <path>`, then the free one whose last task had the most similar title. A new worktree is created only when none is free, up to 30 per project (`ORCA_POOL_CAP`). An OMP worker in a reused worktree gets the earlier task's summary, decisions, and transcript paths in its system prompt; `--resume` continues that worktree's last OMP session instead. Ignored files such as `node_modules` stay, so reuse also skips reinstalls. `pool` lists the slots; `pool --release <path>` returns one by hand.
+
+**Sparse worktrees.** Put gitignore-style patterns in `.orca-sparse-exclude` at the repo root (for example `/archive/` or `*.mp4`), and worker worktrees skip those paths. A task adds one back with `--include '<pattern>'`. On a 1.27 GiB docs repo this cut a worker checkout to 101 MiB.
 
 ## Buzzword bingo, honestly
 

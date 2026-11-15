@@ -54,6 +54,14 @@ SOT_RE = re.compile(r"^\s*(?:[-*]\s*)?SOT\((architecture|business|dev|product)\)
                     re.MULTILINE | re.IGNORECASE)
 DECISIONS_LOG = "decisions.md"
 SPEC_LIMIT = 12000
+POOL_CAP = 30  # worker worktrees per project; ORCA_POOL_CAP overrides
+LAUNCH_WINDOW = dt.timedelta(minutes=10)  # longer than worker-start's 360 s timeout; a crashed launch expires
+# OMP keeps each session transcript under <sessions>/<cwd as a dashed path>/<timestamp>_<id>.jsonl.
+OMP_SESSIONS = Path(os.environ.get("ORCA_OMP_SESSIONS_DIR") or Path.home() / ".omp/agent/sessions")
+SLOT_CONTEXT_DIR = Path(os.environ.get("ORCA_SLOT_CONTEXT_DIR")
+                        or Path.home() / "Library/Application Support/orcestrationmaxxing/slot-context")
+# Repo-relative paths (one per line, `#` comments) that worker worktrees of the repo do not check out.
+SPARSE_FILE = ".orca-sparse-exclude"
 
 WORKER_CONTRACT = """
 --- Lifecycle contract (added by orca-lifecycle.py) ---
@@ -173,6 +181,15 @@ CREATE TABLE IF NOT EXISTS sot_updates (
   files      TEXT,
   done_at    TEXT,
   PRIMARY KEY (task_id, area, note)
+);
+-- Worker worktree pool. busy: task_id is the owner. free: clean, HEAD detached at the base branch, ready for
+-- the next task; task_id is the last task. kept: left out of the pool (uncommitted changes). removed: deleted.
+CREATE TABLE IF NOT EXISTS slots (
+  worktree_path TEXT PRIMARY KEY,
+  project_id    TEXT NOT NULL REFERENCES projects(project_id),
+  state         TEXT NOT NULL CHECK(state IN ('busy','free','kept','removed')),
+  task_id       TEXT NOT NULL REFERENCES tasks(task_id),
+  updated_at    TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS events (
   event_id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -352,6 +369,21 @@ def orca(*args: str, timeout: float = 120) -> dict:
     if not ok:
         raise OrcaError(f"orca {' '.join(args[:2])}: {json.dumps(data.get('error', data))[:300]}")
     return data.get("result") or {}
+
+
+def orca_create(kind: str, *args: str) -> dict:
+    """Create an orchestration task or gate with --full. Returns an object with an `id`.
+
+    Reads the full nested object first; falls back to the compact `<kind>Id` field.
+    """
+    result = orca("orchestration", f"{kind}-create", "--full", *args)
+    obj = result.get(kind)
+    if isinstance(obj, dict) and obj.get("id"):
+        return obj
+    compact = result.get(f"{kind}Id") or result.get(f"{kind}_id")
+    if isinstance(compact, str) and compact:
+        return {"id": compact}
+    raise OrcaError(f"orca orchestration {kind}-create: no {kind} id in response: {json.dumps(result)[:300]}")
 
 
 def git(repo: str, *args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -606,6 +638,8 @@ def record_attempt(db, task_id: str, dispatch_id: str, worktree_path: str | None
     if work_class:
         started["class"] = work_class
     log_event(db, "attempt", dispatch_id, "started", started)
+    if worktree_path and Path(worktree_path).resolve() != Path(repo).resolve():
+        _set_slot(db, worktree_path, task["project_id"], "busy", task_id)
     if task["stage"] != "implementing":
         set_stage(db, task_id, "implementing", ("routed", "rework", "abandoned", "failed"),
                   {"dispatch_id": dispatch_id})
@@ -973,8 +1007,14 @@ def cmd_cancel(db, a) -> dict:
               {"cancelled_by": intent["by"], "reason": intent["reason"], "answer": intent["answer"],
                "stopped": stopped})
     failed = _mark_orca_cancelled(db, task, [t for t in (task["merge_task_id"], a.task) if t], result)
+    branch = (_freshness(db, task) or {}).get("branch")
+    # The stopped worker's worktree goes back to the pool when clean; the branch stays either way.
+    project = get_project(db, task["project_id"])
+    pool = {r["worktree_path"]: _park_slot(db, a.task, project, r["worktree_path"])
+            for r in db.execute("SELECT worktree_path FROM slots WHERE task_id=? AND state='busy'", (a.task,))
+            .fetchall() if Path(r["worktree_path"]).is_dir()}
     return {"task_id": a.task, "stage": "closed", "cancelled": True, "stopped": stopped, "orca_pending": failed,
-            "branch_kept": (_freshness(db, task) or {}).get("branch")}
+            "branch_kept": branch, "pool": pool}
 
 
 def _cancel_intent(db, task_id: str) -> dict | None:
@@ -1016,6 +1056,244 @@ def _worktree_name(db, task: sqlite3.Row) -> str:
     return f"{slug}-{task['task_id'][-6:]}-a{n}"
 
 
+# ---------------------------------------------------------------- worktree pool
+
+
+def _set_slot(db, path: str, project_id: str, state: str, task_id: str) -> None:
+    db.execute("INSERT INTO slots (worktree_path, project_id, state, task_id, updated_at) VALUES (?,?,?,?,?)"
+               " ON CONFLICT(worktree_path) DO UPDATE SET project_id=excluded.project_id, state=excluded.state,"
+               " task_id=excluded.task_id, updated_at=excluded.updated_at",
+               (path, project_id, state, task_id, iso(now())))
+    log_event(db, "slot", path, f"slot:{state}", {"task_id": task_id})
+
+
+def _pool_cap() -> int:
+    return int(os.environ.get("ORCA_POOL_CAP") or POOL_CAP)
+
+
+def _is_clean(path: str) -> bool:
+    status = git(path, "status", "--porcelain", "--untracked-files=all", check=False)
+    return status.returncode == 0 and not status.stdout.strip()
+
+
+def _title_words(title: str | None) -> set[str]:
+    return {w for w in re.findall(r"\w+", (title or "").lower()) if len(w) >= 4}
+
+
+def _park_slot(db, task_id: str, project: sqlite3.Row, path: str, report_sha: str | None = None) -> str:
+    """Return a finished worktree to the pool: writers stopped (confirmed by Orca), clean, HEAD detached at the
+    base branch (the task's branch stays) means free. Unconfirmed shutdown or uncommitted changes keep it out of
+    the pool ('kept') untouched; nothing is discarded. The one exception is an accepted report identical to its
+    stored copy, which the registry and the export already hold. The task's own lifecycle state is not affected."""
+    state = "kept"
+    if _slot_unquiet(db, path) is None:
+        if report_sha and _only_stored_report_dirty(db, task_id, path, report_sha):
+            row = db.execute("SELECT path FROM reports WHERE task_id=? AND sha256=?",
+                             (task_id, report_sha)).fetchone()
+            Path(row["path"]).unlink()
+        if _is_clean(path) and git(path, "switch", "--quiet", "--detach", project["base_branch"],
+                                   check=False).returncode == 0:
+            state = "free"
+    _set_slot(db, path, project["project_id"], state, task_id)
+    return state
+
+
+def _launching(db, entity_type: str, entity_id: str) -> bool:
+    """True while a start-worker launch for this task or slot runs with the registry lock released."""
+    row = db.execute("SELECT transition, timestamp FROM events WHERE entity_type=? AND entity_id=?"
+                     " AND transition IN ('launch_started','launch_ended') ORDER BY event_id DESC LIMIT 1",
+                     (entity_type, entity_id)).fetchone()
+    return bool(row) and row["transition"] == "launch_started" and now() - parse_time(row["timestamp"]) < LAUNCH_WINDOW
+
+
+def _choose_slot(db, task: sqlite3.Row, project: sqlite3.Row, choice: str | None) -> tuple[str, bool] | None:
+    """(path, own) of the worktree to reuse, or None for a new one. The task's own worktree comes first (rework
+    continues its branch). Then `--slot <path>`, else the free slot whose last task title shares the most words
+    with this one, ties to the most recently freed. A free slot found dirty is marked 'kept' and skipped."""
+    if choice == "new":
+        return None
+    own = [r["worktree_path"] for r in db.execute(
+        "SELECT worktree_path FROM slots WHERE task_id=? AND state='busy' ORDER BY updated_at DESC",
+        (task["task_id"],)) if Path(r["worktree_path"]).is_dir()]
+    if choice:
+        if choice in own:
+            return choice, True
+        row = db.execute("SELECT * FROM slots WHERE worktree_path=? AND project_id=?",
+                         (choice, project["project_id"])).fetchone()
+        if row is None or row["state"] != "free" or not Path(choice).is_dir() or not _is_clean(choice):
+            raise Refused(f"{choice} is not a free, clean worktree of project {project['project_id']};"
+                          f" run `orca-lifecycle.py pool` to see the slots, or pass `--slot new`")
+        return choice, False
+    if own:
+        return own[0], True
+    free = db.execute("SELECT s.worktree_path, s.updated_at, t.title FROM slots s JOIN tasks t USING (task_id)"
+                      " WHERE s.project_id=? AND s.state='free'", (project["project_id"],)).fetchall()
+    want = _title_words(task["title"])
+    for row in sorted(free, key=lambda r: (len(want & _title_words(r["title"])), r["updated_at"]), reverse=True):
+        path = row["worktree_path"]
+        if not Path(path).is_dir():
+            _set_slot(db, path, project["project_id"], "removed", task["task_id"])
+        elif _is_clean(path):
+            return path, False
+        else:
+            db.execute("UPDATE slots SET state='kept', updated_at=? WHERE worktree_path=?", (iso(now()), path))
+    return None
+
+
+def _require_pool_room(db, project: sqlite3.Row) -> None:
+    cap = _pool_cap()
+    used = sum(1 for r in db.execute("SELECT worktree_path FROM slots WHERE project_id=? AND state != 'removed'",
+                                     (project["project_id"],)) if Path(r["worktree_path"]).is_dir())
+    if used >= cap:
+        raise Refused(f"the worktree pool of project {project['project_id']} is full: {used} of {cap} worktrees"
+                      f" are busy or kept. Merge or accept finished tasks, return an ended task's worktree with"
+                      f" `orca-lifecycle.py pool --release <path>`, or raise ORCA_POOL_CAP")
+
+
+def _slot_unquiet(db, path: str) -> str | None:
+    """Stop every writer in a worktree: close all its terminals, then confirm through `orca worktree ps` that none
+    is left. Returns None when confirmed, else why not. A live worker's checkout is never switched or reused."""
+    try:
+        for selector in orca_worktree_selectors(path):
+            orca("terminal", "close", "--worktree", selector, "--all")
+        ps = orca("worktree", "ps", "--limit", "100000", timeout=30)
+    except OrcaError as exc:
+        why = str(exc)
+    else:
+        want = os.path.realpath(path)
+        mine = [r for r in ps.get("worktrees") or [] if r.get("path") and os.path.realpath(r["path"]) == want]
+        live = [r for r in mine
+                if r.get("liveTerminalCount") or r.get("unverifiableTerminalCount") or r.get("hasAttachedPty")]
+        why = None if mine and not live and not ps.get("truncated") else \
+            f"live terminals: {len(live)}, listed by Orca: {bool(mine)}"
+    log_event(db, "slot", path, "quiesce_failed" if why else "quiesced", {"error": why} if why else {})
+    return why
+
+
+def _quiesce_slot(db, path: str) -> None:
+    why = _slot_unquiet(db, path)
+    if why:
+        raise Refused(f"could not confirm that no worker runs in {path} ({why}); check it with"
+                      f" `orca worktree ps`, or pass `--slot new`")
+
+
+def _session_cwd(path: Path) -> str | None:
+    try:
+        with path.open(encoding="utf-8") as fh:
+            for _, line in zip(range(5), fh):
+                rec = json.loads(line)
+                if rec.get("type") == "session":
+                    return rec.get("cwd")
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _omp_sessions(worktree: str, since: str | None = None) -> list[Path]:
+    """OMP transcripts recorded with `worktree` as working folder, newest first, started at or after `since`."""
+    p = Path(worktree)
+    try:
+        rel = p.relative_to(Path.home())  # OMP names the folder after the cwd relative to home, else absolute
+    except ValueError:
+        rel = p.relative_to(p.anchor)
+    folder = OMP_SESSIONS / ("-" + str(rel).replace("/", "-"))
+    cutoff = (since or "").replace(":", "-")[:19]
+    want = os.path.realpath(worktree)
+    return [f for f in sorted(folder.glob("*.jsonl"), reverse=True) if f.name[:19] >= cutoff
+            and os.path.realpath(_session_cwd(f) or "/nonexistent") == want] if folder.is_dir() else []
+
+
+def _task_outcome(db, task_id: str) -> tuple[str, list[str]]:
+    """Summary and DECISION lines of a task: from capture when it ran, else from the worker_done report."""
+    row = db.execute("SELECT evidence_json FROM events WHERE entity_type='task' AND entity_id=?"
+                     " AND transition='captured' ORDER BY event_id DESC LIMIT 1", (task_id,)).fetchone()
+    if row:
+        ev = json.loads(row["evidence_json"])
+        return ev.get("summary") or "", ev.get("decisions") or []
+    attempt = latest_attempt(db, task_id, "completed")
+    body = _worker_done_evidence(db, attempt["dispatch_id"]).get("body", "") if attempt else ""
+    return _summary(body), list(dict.fromkeys(DECISION_RE.findall(body)))
+
+
+def _slot_context(db, task_id: str, worktree: str, prev_task_id: str) -> Path:
+    """Write what the worktree's earlier task did, for the next worker's system prompt. Returns the file."""
+    prev = get_task(db, prev_task_id)
+    summary, decisions = _task_outcome(db, prev_task_id)
+    # The worker's OMP session starts during the launch, before its attempt is recorded: count from the first
+    # launch of that task, or a launch window before its first attempt here (attempts recorded by `attempt`).
+    launched = db.execute("SELECT min(timestamp) FROM events WHERE entity_type='task' AND entity_id=?"
+                          " AND transition='launch_started'", (prev_task_id,)).fetchone()[0]
+    first = db.execute("SELECT min(created_at) FROM attempts WHERE task_id=? AND worktree_path=?",
+                       (prev_task_id, worktree)).fetchone()[0]
+    since = launched or (iso(parse_time(first) - LAUNCH_WINDOW) if first else None)
+    sessions = _omp_sessions(worktree, since)
+    lines = ["# Earlier task in this worktree", "",
+             f"This worktree last served task {prev_task_id}: {prev['title'] or '(no title)'}"
+             f" (stage {prev['stage']}). Use it only where it helps your own task.", ""]
+    if summary:
+        lines += [f"Outcome: {summary}", ""]
+    if decisions:
+        lines += ["Decisions:", *[f"- {d}" for d in decisions], ""]
+    if sessions:
+        lines += ["Earlier worker transcripts (JSONL, newest first; read only what you need):",
+                  *[f"- {s}" for s in sessions[:3]], ""]
+    SLOT_CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
+    out = SLOT_CONTEXT_DIR / f"{task_id}-{now().strftime('%Y%m%dT%H%M%S')}.md"
+    out.write_text("\n".join(lines), encoding="utf-8")
+    return out
+
+
+def _sparse_patterns(repo: str) -> list[str]:
+    path = Path(repo) / SPARSE_FILE
+    if not path.is_file():
+        return []
+    return [ln.strip() for ln in path.read_text(encoding="utf-8").splitlines()
+            if ln.strip() and not ln.strip().startswith("#")]
+
+
+def _apply_sparse(worktree: str, repo: str, include: list[str]) -> list[str] | None:
+    """Check out everything except the repo's SPARSE_FILE patterns (gitignore syntax: `/dir/` anchored, `*.mp4`
+    anywhere); the task's --include patterns come back (later patterns win). Returns the sparse patterns, or None
+    when the worktree stays (or becomes again) a full checkout."""
+    excluded = [f"!{x}" for x in _sparse_patterns(repo)]
+    if not excluded:
+        if git(worktree, "sparse-checkout", "list", check=False).returncode == 0:
+            git(worktree, "sparse-checkout", "disable")
+        return None
+    spec = ["/*", *excluded, *include]
+    proc = subprocess.run(["git", "-C", worktree, "sparse-checkout", "set", "--no-cone", "--stdin"],
+                          input="\n".join(spec) + "\n", capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise Refused(f"git sparse-checkout in {worktree}: {proc.stderr.strip()[:300]}")
+    return spec
+
+
+
+def cmd_pool(db, a) -> dict:
+    """List the worker worktree pool, or return an ended task's worktree to it."""
+    if a.release:
+        row = db.execute("SELECT * FROM slots WHERE worktree_path=?", (a.release,)).fetchone()
+        if row is None:
+            raise Refused(f"{a.release} is not a pool slot; run `orca-lifecycle.py pool`")
+        if row["state"] == "busy" and latest_attempt(db, row["task_id"], "active") is not None:
+            raise Refused(f"task {row['task_id']} still has a running worker in {a.release}")
+        if not Path(a.release).is_dir():
+            raise Refused(f"{a.release} no longer exists")
+        task = get_task(db, row["task_id"])
+        if _launching(db, "slot", a.release):
+            raise Refused(f"a worker for task {row['task_id']} is being started in {a.release}; wait for that"
+                          f" start-worker to finish")
+        _quiesce_slot(db, a.release)  # a reserved slot may hold a partial launch without a recorded attempt
+        if _park_slot(db, task["task_id"], get_project(db, task["project_id"]), a.release) != "free":
+            raise Refused(f"{a.release} has uncommitted changes; commit or move them, then release again")
+    rows = db.execute("SELECT s.*, t.title FROM slots s JOIN tasks t USING (task_id)"
+                      " WHERE s.state != 'removed' ORDER BY s.project_id, s.state, s.updated_at DESC").fetchall()
+    return {"cap": _pool_cap(), "slots": [
+        {"path": r["worktree_path"], "project": r["project_id"], "state": r["state"],
+         "task": r["task_id"] if r["state"] == "busy" else None, "last_task": r["task_id"],
+         "title": r["title"], "since": r["updated_at"]} for r in rows]}
+
+
 def cmd_start_worker(db, a) -> dict:
     """Create (optional), track, and start one worker, then record its Dispatch. One command, no gaps."""
     if a.spec:
@@ -1025,10 +1303,10 @@ def cmd_start_worker(db, a) -> dict:
         spec = f"{a.spec.rstrip()}\n{WORKER_CONTRACT}"
         if len(spec) > SPEC_LIMIT:
             raise Refused(f"spec is {len(spec)} characters; the limit is {SPEC_LIMIT}. Point to a file instead")
-        create = ["orchestration", "task-create", "--run", a.run, "--task-title", a.title[:120], "--spec", spec]
+        create = ["--run", a.run, "--task-title", a.title[:120], "--spec", spec]
         if a.deps:
             create += ["--deps", a.deps]
-        task_id = orca(*create)["task"]["id"]
+        task_id = orca_create("task", *create)["id"]
         track_task(db, task_id, a.run, a.project, a.acceptance, a.kind, a.title, a.work_class)
     elif a.task:
         task_id = a.task
@@ -1049,6 +1327,8 @@ def cmd_start_worker(db, a) -> dict:
 
     if latest_attempt(db, task_id, "active") is not None:
         raise Refused(f"task {task_id} already has an active Dispatch; settle it or let `recover` abandon it")
+    if _launching(db, "task", task_id):
+        raise Refused(f"another start-worker for task {task_id} is still launching; wait for it to finish")
     if task["work_class"] != a.work_class:
         db.execute("UPDATE tasks SET work_class=? WHERE task_id=?", (a.work_class, task_id))
     project = get_project(db, task["project_id"])
@@ -1057,13 +1337,26 @@ def cmd_start_worker(db, a) -> dict:
                    .get("tasks", []) if t.get("id") == task_id), None)
     name = a.name or _worktree_name(db, task)
     base = a.base_branch or project["base_branch"]
-    args = ["orchestration", "worker-start", "--task", task_id, "--run", task["run_id"],
-            "--repo", orca_repo_path(project["repo_path"]), "--worktree", "new-child",
-            "--name", name, "--base-branch", base, "--agent", a.agent, "--timeout-ms", "300000"]
+    slot = _choose_slot(db, task, project, a.slot)
+    if slot is None:
+        _require_pool_room(db, project)
+        if a.agent != "omp" and _sparse_patterns(project["repo_path"]):
+            # Orca starts other agents together with the worktree, so sparse could only come after they run.
+            raise Refused(f"{project['repo_path']} has {SPARSE_FILE}, and only OMP workers get a sparse new"
+                          f" worktree before they start; use --agent omp, or reuse a slot (--slot <path>)")
+        args = ["orchestration", "worker-start", "--task", task_id, "--run", task["run_id"],
+                "--repo", orca_repo_path(project["repo_path"]), "--worktree", "new-child",
+                "--name", name, "--base-branch", base, "--agent", a.agent, "--timeout-ms", "300000"]
+        if a.setup:
+            args += ["--setup", a.setup]
+    else:
+        if a.setup:
+            raise Refused("setup hooks never rerun in a reused worktree; pass `--slot new` to get a new one")
+        # Orca rejects creation flags (--name, --repo, --base-branch, --setup) for an existing worktree.
+        args = ["orchestration", "worker-start", "--task", task_id, "--run", task["run_id"],
+                "--worktree", orca_worktree_selectors(slot[0])[0], "--agent", a.agent, "--timeout-ms", "300000"]
     if a.model:
         args += ["--model", a.model]
-    if a.setup:
-        args += ["--setup", a.setup]
     retry: list[str] = []
     # Orca 1.4.222 rules (orcad.js): --retry-of needs Task failed/blocked; a plain start needs Task ready.
     if status == "completed":
@@ -1077,11 +1370,46 @@ def cmd_start_worker(db, a) -> dict:
         retry = ["--retry-of", last["dispatch_id"]]
     elif status != "ready":
         raise Refused(f"Orca Task {task_id} is '{status}'; only ready, completed, failed, or blocked can start")
+    omp_args: list[str] = []
+    context = None
+    if a.resume:
+        if a.agent != "omp" or slot is None:
+            raise Refused("--resume needs --agent omp and a reused worktree (the task's own or a pool slot)")
+        sessions = _omp_sessions(slot[0])
+        if not sessions:
+            raise Refused(f"no earlier OMP session was recorded in {slot[0]}; start without --resume")
+        omp_args = ["--resume", str(sessions[0])]
+    new_branch = None
+    if slot is not None:
+        prev_task = db.execute("SELECT task_id FROM slots WHERE worktree_path=?", (slot[0],)).fetchone()["task_id"]
+        _quiesce_slot(db, slot[0])
+        if not slot[1]:  # a pooled worktree is detached at base; the new task gets its own branch from base
+            new_branch = name
+            git(slot[0], "switch", "--quiet", "-c", new_branch, base)
+        sparse = _apply_sparse(slot[0], project["repo_path"], a.include or [])
+        if sparse:
+            log_event(db, "slot", slot[0], "sparse", {"patterns": sparse})
+        if not a.resume:  # a resumed session already holds that context
+            context = _slot_context(db, task_id, slot[0], prev_task)
+            omp_args = ["--append-system-prompt", str(context)]
+        # Reserve the slot before the launch releases the registry lock: a concurrent start must not pick it.
+        # A failed or partial launch keeps the reservation and the branch (Orca's residual worker may use them);
+        # the task's next start continues there as its own worktree, or `pool --release` returns it.
+        _set_slot(db, slot[0], project["project_id"], "busy", task_id)
+    slot_path = slot[0] if slot else None
+    # Seen by a second start of this task or a `pool --release` while the lock is released for the launch.
+    log_event(db, "task", task_id, "launch_started", {"slot": slot_path})
+    if slot_path:
+        log_event(db, "slot", slot_path, "launch_started", {"task_id": task_id})
     if a.agent == "omp":
-        ok, data, large_worktree = _unlocked(db, lambda: _start_large(task, project, a, name, base, retry))
+        ok, data, large_worktree = _unlocked(db, lambda: _start_large(task, project, a, name, base, retry, slot_path,
+                                                                      omp_args))
     else:
         ok, data = _unlocked(db, lambda: orca_raw(*args, *retry, timeout=360))
         large_worktree = None
+    log_event(db, "task", task_id, "launch_ended", {"ok": ok})
+    if slot_path:
+        log_event(db, "slot", slot_path, "launch_ended", {"ok": ok})
     result = data.get("result") or {}
     if not ok:
         log_event(db, "task", task_id, "worker_start_failed",
@@ -1090,20 +1418,34 @@ def cmd_start_worker(db, a) -> dict:
                 "residualResources": result.get("residualResources"), "exit_code": 1,
                 "next": "do not relaunch; read failedStage and residualResources, then"
                         " `orca skills get orchestration --reference references/recovery-and-cleanup.md`"}
-    worktree = large_worktree or next((e["id"].split("::", 1)[1] for e in result.get("effects", [])
-                                       if e.get("kind") == "worktree" and "::" in str(e.get("id"))), None)
+    worktree = slot_path or large_worktree or next((e["id"].split("::", 1)[1] for e in result.get("effects", [])
+                                                    if e.get("kind") == "worktree" and "::" in str(e.get("id"))),
+                                                   None)
     out = record_attempt(db, task_id, result["dispatchId"], worktree, None, a.session, a.work_class)
+    if context:
+        out["slot_context"] = str(context)
+        if a.agent != "omp":
+            out["slot_context_note"] = "only OMP workers get this file in their system prompt; send it yourself"
     if result.get("briefSubmitted"):
         log_event(db, "attempt", result["dispatchId"], "brief_submitted", {"reason": "brief left in input box"})
+    if new_branch:  # the sidebar names the current task, not the slot's first one
+        for selector in orca_worktree_selectors(worktree):
+            renamed, data = orca_raw("worktree", "set", "--worktree", selector, "--display-name", new_branch,
+                                     timeout=15)
+            if not renamed:
+                log_event(db, "slot", worktree, "rename_failed", {"error": data.get("error")})
+    if slot_path:
+        out["reused_worktree"] = slot_path
     out["next"] = "orca-lifecycle.py wait"
     return out
 
 
 def _start_large(task: sqlite3.Row, project: sqlite3.Row, a, name: str, base: str,
-                 retry: list[str]) -> tuple[bool, dict, str | None]:
+                 retry: list[str], slot_path: str | None = None,
+                 omp_args: list[str] | None = None) -> tuple[bool, dict, str | None]:
     """Start an OMP worker with the worker overlay and keep its Dispatch: Orca's worker-start has no argv or env
-    hook. worktree create, then terminal create running Orca's own OMP command plus the overlay, then
-    worker-start --terminal adopts it once the TUI is idle."""
+    hook. worktree create (skipped for a reused pool slot), then terminal create running Orca's own OMP command
+    plus the overlay, then worker-start --terminal adopts it once the TUI is idle."""
     if not NOPLAN_OVERLAY.exists() or NOPLAN_OVERLAY.read_text() != NOPLAN_OVERLAY_TEXT:
         NOPLAN_OVERLAY.parent.mkdir(parents=True, exist_ok=True)
         NOPLAN_OVERLAY.write_text(NOPLAN_OVERLAY_TEXT)
@@ -1112,22 +1454,30 @@ def _start_large(task: sqlite3.Row, project: sqlite3.Row, a, name: str, base: st
                "--config", str(NOPLAN_OVERLAY)]
     if a.model:
         command += ["--model", a.model]
+    command += omp_args or []
     residual: list[str] = []
 
     def failed(stage: str, data: dict) -> tuple[bool, dict, None]:
         return False, {"error": data.get("error"),
                        "result": {"failedStage": stage, "residualResources": residual}}, None
 
-    create = ["worktree", "create", "--name", name, "--repo", orca_repo_path(project["repo_path"]),
-              "--base-branch", base]
-    if a.setup:
-        create += ["--setup", a.setup]
-    ok, data = orca_raw(*create)
-    if not ok:
-        return failed("worktree-create", data)
-    wid = data["result"]["worktree"]["id"]
-    residual.append(wid)
-    ok, data = orca_raw("terminal", "create", "--worktree", f"id:{wid}", "--title", name,
+    if slot_path:
+        selector = orca_worktree_selectors(slot_path)[0]
+    else:
+        create = ["worktree", "create", "--name", name, "--repo", orca_repo_path(project["repo_path"]),
+                  "--base-branch", base]
+        if a.setup:
+            create += ["--setup", a.setup]
+        ok, data = orca_raw(*create)
+        if not ok:
+            return failed("worktree-create", data)
+        selector = f"id:{data['result']['worktree']['id']}"
+        residual.append(selector.removeprefix("id:"))
+        try:  # before the agent starts, so it never sees files disappear
+            _apply_sparse(selector.split("::", 1)[1], project["repo_path"], a.include or [])
+        except Refused as exc:
+            return failed("sparse-checkout", {"error": str(exc)})
+    ok, data = orca_raw("terminal", "create", "--worktree", selector, "--title", name,
                         "--command", shlex.join(command))
     if not ok:
         return failed("terminal-create", data)
@@ -1139,7 +1489,7 @@ def _start_large(task: sqlite3.Row, project: sqlite3.Row, a, name: str, base: st
         if not ok:
             return failed(stage, data)
     ok, data = orca_raw("orchestration", "worker-start", "--task", task["task_id"], "--run", task["run_id"],
-                        "--worktree", f"id:{wid}", "--terminal", handle, "--timeout-ms", "300000", *retry,
+                        "--worktree", selector, "--terminal", handle, "--timeout-ms", "300000", *retry,
                         timeout=360)
     if not ok:
         result = data.get("result") or {}
@@ -1150,7 +1500,7 @@ def _start_large(task: sqlite3.Row, project: sqlite3.Row, a, name: str, base: st
         # Observed with Orca 1.4.222: the brief pasted into an adopted OMP terminal can stay in the input box.
         orca_raw("terminal", "send", "--terminal", handle, "--enter")
         data.setdefault("result", {})["briefSubmitted"] = True
-    return True, data, wid.split("::", 1)[1]
+    return True, data, slot_path or selector.removeprefix("id:").split("::", 1)[1]
 
 
 BRIEF_LEAD = "Please carry out this task from my Orca coordinator"
@@ -1209,18 +1559,18 @@ def cmd_review(db, a) -> dict:
                   if (t.get("spec") or "").startswith(marker) and t.get("status") not in ("failed", "completed")),
                  None)
     if merge is None:
-        merge = orca("orchestration", "task-create", "--run", task["run_id"],
-                     "--task-title", f"merge: {title}"[:120],
-                     "--spec", f"{marker}({title}). Coordinator merges only after"
-                               f" `orca-lifecycle.py approve --task {a.task}`. Never dispatch this task.",
-                     "--deps", json.dumps([a.task]))["task"]
+        merge = orca_create("task", "--run", task["run_id"],
+                            "--task-title", f"merge: {title}"[:120],
+                            "--spec", f"{marker}({title}). Coordinator merges only after"
+                                      f" `orca-lifecycle.py approve --task {a.task}`. Never dispatch this task.",
+                            "--deps", json.dumps([a.task]))
     gate = next((g for g in orca("orchestration", "gate-list", "--run", task["run_id"], "--task", merge["id"],
                                  "--status", "pending").get("gates", [])), None)
     if gate is None:
-        gate = orca("orchestration", "gate-create", "--task", merge["id"],
-                    "--question", f"Approve {'merge' if task['kind'] == 'code' else 'report'} of {a.task}:"
-                                  f" {title} at {pin[:12]}?",
-                    "--options", json.dumps(["approve", "reject"]))["gate"]
+        gate = orca_create("gate", "--task", merge["id"],
+                           "--question", f"Approve {'merge' if task['kind'] == 'code' else 'report'} of {a.task}:"
+                                         f" {title} at {pin[:12]}?",
+                           "--options", json.dumps(["approve", "reject"]))
     db.execute("UPDATE tasks SET merge_task_id=?, merge_gate_id=? WHERE task_id=?",
                (merge["id"], gate["id"], a.task))
     set_stage(db, a.task, "awaiting_approval", ("reviewing",),
@@ -1299,9 +1649,12 @@ def _only_stored_report_dirty(db, task_id: str, wt: str, sha: str) -> bool:
     return hashlib.sha256(report.read_bytes()).hexdigest() == sha
 
 
-def _finish_worktrees(db, task_id: str, repo: str, remove: bool, out: dict, force_latest: bool = False) -> None:
+def _finish_worktrees(db, task_id: str, project: sqlite3.Row, remove: bool, out: dict, force_latest: bool = False,
+                      report_sha: str | None = None) -> None:
     """After merge/accept, every worktree of the task is finished, not only the merged attempt's: Done on the
-    board (set_stage already moved the latest one), then terminals closed, or the worktree deleted when asked."""
+    board (set_stage already moved the latest one), terminals closed, then back to the pool when clean (see
+    `_park_slot`), or the worktree deleted when asked. A worktree another task has since reused is left alone."""
+    repo = project["repo_path"]
     latest = latest_attempt(db, task_id, "completed")
     seen: set[str] = set()
     for att in db.execute("SELECT * FROM attempts WHERE task_id=? AND worktree_path IS NOT NULL"
@@ -1310,6 +1663,9 @@ def _finish_worktrees(db, task_id: str, repo: str, remove: bool, out: dict, forc
         if wt in seen or Path(wt).resolve() == Path(repo).resolve() or not Path(wt).is_dir():
             continue
         seen.add(wt)
+        slot = db.execute("SELECT task_id FROM slots WHERE worktree_path=?", (wt,)).fetchone()
+        if slot is not None and slot["task_id"] != task_id:
+            continue
         is_latest = latest is not None and att["dispatch_id"] == latest["dispatch_id"]
         if not is_latest:
             set_board_status(db, att["dispatch_id"], wt, "completed")
@@ -1328,6 +1684,11 @@ def _finish_worktrees(db, task_id: str, repo: str, remove: bool, out: dict, forc
         except OrcaError as exc:
             log_event(db, "attempt", att["dispatch_id"], failed, {"error": str(exc)})
             out.setdefault(failed, []).append(str(exc))
+            continue  # a worktree whose terminals may still run never goes back to the pool
+        if remove:
+            _set_slot(db, wt, project["project_id"], "removed", task_id)
+        else:
+            out.setdefault("pool", {})[wt] = _park_slot(db, task_id, project, wt, report_sha)
 
 
 def cmd_accept(db, a) -> dict:
@@ -1352,7 +1713,7 @@ def cmd_accept(db, a) -> dict:
     # the sole change and matches the stored copy: then nothing is lost.
     force = bool(attempt and attempt["worktree_path"] and Path(attempt["worktree_path"]).is_dir()
                  and _only_stored_report_dirty(db, a.task, attempt["worktree_path"], approved))
-    _finish_worktrees(db, a.task, get_project(db, task["project_id"])["repo_path"], a.remove_worktree, out, force)
+    _finish_worktrees(db, a.task, get_project(db, task["project_id"]), a.remove_worktree, out, force, approved)
     out["next"] = f"orca-lifecycle.py capture --task {a.task}"
     return out
 
@@ -1416,7 +1777,7 @@ def cmd_merge(db, a) -> dict:
     set_stage(db, a.task, "merged", ("approved",),
               {"sha": sha, "branch": branch, "into": into, "approved_sha": approved})
     out = {"task_id": a.task, "stage": "merged", "sha": sha, "branch": branch, "into": into, "kept_dirty": kept_dirty}
-    _finish_worktrees(db, a.task, repo, a.remove_worktree, out)
+    _finish_worktrees(db, a.task, get_project(db, task["project_id"]), a.remove_worktree, out)
     out["next"] = f"orca-lifecycle.py capture --task {a.task}"
     return out
 
@@ -1719,9 +2080,9 @@ def cmd_import_tickets(db, a) -> dict:
             spec = f"{head}\n{body}\n{WORKER_CONTRACT}"
             # Reuse a Task that a crashed earlier import created in Orca but never recorded here.
             existing = next((x for x in listed if (x.get("spec") or "").startswith(head)), None)
-            task_id = existing["id"] if existing else orca(
-                "orchestration", "task-create", "--run", a.run, "--task-title", t["title"][:120], "--spec", spec,
-                "--deps", json.dumps(deps))["task"]["id"]
+            task_id = existing["id"] if existing else orca_create(
+                "task", "--run", a.run, "--task-title", t["title"][:120], "--spec", spec,
+                "--deps", json.dumps(deps))["id"]
             kind = a.kind or ("report" if t["type"] == "research" else "code")
             track_task(db, task_id, a.run, a.project,
                        t["acceptance"] or f"See the acceptance section of {t['path']}", kind, t["title"], "large")
@@ -1787,9 +2148,10 @@ def attention_rows(db) -> tuple[list[dict], list[str]]:
     for run in runs:
         try:
             for g in orca("orchestration", "gate-list", "--run", run, "--status", "pending").get("gates", []):
-                if g["task_id"] not in merge_tasks:
-                    rows.append({"priority": 1, "kind": "gate", "task_id": g["task_id"], "run_id": run,
-                                 "stage": None, "detail": g["question"][:200],
+                gate_task = g.get("task_id") or g.get("taskId")  # compact output is camelCase; None = orphan gate
+                if gate_task not in merge_tasks:
+                    rows.append({"priority": 1, "kind": "gate", "task_id": gate_task, "run_id": run,
+                                 "stage": None, "detail": (g.get("question") or "")[:200],
                                  "next": f"orca-lifecycle.py gate --id {g['id']} --resolution \"<choice>\""
                                          " --by <name> --answer \"<verbatim answer>\""})
             workers.update(orca_workers(run))
@@ -1968,9 +2330,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--deps", help="JSON array of Orca task ids")
     s.add_argument("--agent", required=True, help="Orca agent id, for example omp, claude, codex")
     s.add_argument("--model")
-    s.add_argument("--name", help="worktree name (default: <title-slug>-<task>-a<attempt>)")
+    s.add_argument("--name", help="worktree name, or the branch name in a reused worktree"
+                                  " (default: <title-slug>-<task>-a<attempt>)")
     s.add_argument("--base-branch", help="override the project's base branch")
-    s.add_argument("--setup", choices=("run", "skip", "inherit"))
+    s.add_argument("--setup", choices=("run", "skip", "inherit"), help="setup policy for a new worktree")
+    s.add_argument("--slot", help="pool worktree path to reuse, or `new` for a new worktree"
+                                  " (default: the task's own worktree, else the most similar free slot)")
+    s.add_argument("--resume", action="store_true",
+                   help="OMP only, reused worktree only: resume the newest OMP session recorded in that worktree"
+                        " instead of a fresh session with the earlier task's summary")
+    s.add_argument("--include", action="append", metavar="PATH",
+                   help=f"check out this repo path although {SPARSE_FILE} excludes it; repeat per path")
     s.add_argument("--session", help="harness session id to record")
     s.add_argument("--class", dest="work_class", required=True, choices=("small", "large"),
                    help="ticket size label for the coordinator (imported tickets are large); every OMP worker"
@@ -2028,12 +2398,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--task", required=True)
     s.add_argument("--into", help="expected checked-out target branch")
     s.add_argument("--remove-worktree", action="store_true",
-                   help="delete the worker worktree (default: keep it in Done with its terminals closed)")
+                   help="delete the worker worktree (default: close its terminals, return it to the pool)")
 
     s = sub.add_parser("accept", help="finish an approved report task (needs a human approval)")
     s.add_argument("--task", required=True)
     s.add_argument("--remove-worktree", action="store_true",
-                   help="delete the worker worktree (default: keep it in Done with its terminals closed)")
+                   help="delete the worker worktree (default: close its terminals, return it to the pool)")
     s.add_argument("--export-dir", help=f"where the accepted report is written (default {REPORTS_DIR})")
 
     s = sub.add_parser("capture", help="log DECISION: lines; close, or list SOT( ) updates still due")
@@ -2074,6 +2444,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--repo", help="only tasks of projects in this git repo (any checkout or worktree of it)")
 
     sub.add_parser("recover", help="reconcile attempts with expired leases")
+    s = sub.add_parser("pool", help="list the worker worktree pool, or return an ended task's worktree to it")
+    s.add_argument("--release", metavar="PATH", help="worktree of a task without a running worker")
     s = sub.add_parser("status", help="attention queue")
     s.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     s = sub.add_parser("reload", help="recover, then print the control-plane snapshot")
@@ -2090,7 +2462,7 @@ COMMANDS = {
     "merge": cmd_merge, "accept": cmd_accept, "capture": cmd_capture, "sot-done": cmd_sot_done,
     "answer": cmd_answer, "gate": cmd_gate, "discard": cmd_discard,
     "recover": cmd_recover, "status": cmd_status, "reload": cmd_reload,
-    "sync": cmd_sync, "cancel": cmd_cancel, "sweep": cmd_sweep,
+    "sync": cmd_sync, "cancel": cmd_cancel, "sweep": cmd_sweep, "pool": cmd_pool,
 }
 
 
